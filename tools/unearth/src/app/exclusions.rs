@@ -42,7 +42,7 @@ impl Exclusions {
         }
     }
 
-    fn from_lines(contents: &str) -> Result<Self, String> {
+    pub(crate) fn from_lines(contents: &str) -> Result<Self, String> {
         let mut rules = Vec::new();
         for (line_number, line) in contents.lines().enumerate() {
             let line = line.trim_end_matches('\r');

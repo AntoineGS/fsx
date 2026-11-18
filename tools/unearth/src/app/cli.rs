@@ -856,6 +856,7 @@ where
     }
     if opts.require_live_index
         && (opts.index_if_watched
+            || opts.case_sensitive
             || opts.recent_limit.is_some()
             || opts.index_refresh.is_some()
             || opts.index_snapshot.is_some()

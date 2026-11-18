@@ -126,6 +126,71 @@ pub(crate) fn write_binary_path_record<W: Write>(
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(bytes)
 }
+
+struct StrictBinarySpool {
+    path: PathBuf,
+    file: File,
+}
+
+impl StrictBinarySpool {
+    fn create() -> Result<Self, String> {
+        for attempt in 0..100 {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let path = env::temp_dir().join(format!(
+                "unearth-query-{}-{nonce}-{attempt}.bin",
+                std::process::id()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("cannot create strict query spool: {error}")),
+            }
+        }
+        Err("cannot allocate a unique strict query spool".to_string())
+    }
+
+    fn publish<W: Write>(&mut self, output: &mut W) -> Result<(), String> {
+        self.file.flush().map_err(|e| e.to_string())?;
+        self.file
+            .seek(io::SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        io::copy(&mut self.file, output).map_err(|e| e.to_string())?;
+        output.flush().map_err(|e| e.to_string())
+    }
+}
+
+impl Drop for StrictBinarySpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn stage_strict_binary_results<W: Write>(
+    reader: &mut BufReader<UnixStream>,
+    output: &mut W,
+) -> Result<(), String> {
+    let mut spool = StrictBinarySpool::create()?;
+    read_query_results(reader, |result| {
+        write_binary_path_record(&mut spool.file, &result.path, result.path_encoded)
+            .map_err(|error| error.to_string())
+    })?;
+    spool.publish(output)
+}
+
+fn strict_binary_output_terminal_error(stdout_is_tty: bool) -> Option<&'static str> {
+    stdout_is_tty.then_some("refusing to write strict binary index results to a terminal")
+}
+
 pub(crate) fn path_has_hidden_component_below(path: &str, root: &str) -> bool {
     let path = path.trim_end_matches('/');
     let root = root.trim_end_matches('/');
@@ -794,9 +859,14 @@ pub(crate) fn run_indexed_via_daemon(
     cache: &mut DirStatsCache,
     colors: &ColorSpec,
 ) -> Result<Option<SearchRun>, String> {
+    if opts.require_live_index {
+        if let Some(error) = strict_binary_output_terminal_error(io::stdout().is_terminal()) {
+            return Err(error.to_string());
+        }
+    }
     /* The daemon protocol predates case-sensitive requests. Use the local
      * indexed query path until that protocol grows a versioned flag. */
-    if opts.case_sensitive {
+    if opts.case_sensitive && !opts.require_live_index {
         return Ok(None);
     }
 
@@ -815,13 +885,18 @@ pub(crate) fn run_indexed_via_daemon(
     };
     let root = fs::canonicalize(&root_raw).map_err(|e| e.to_string())?;
     let root_key = normalize_index_dir(&root);
-    let status_conn = match open_index_db_for_search() {
-        Ok(conn) => conn,
-        Err(_) => return Ok(None),
+    let status_conn = if opts.require_live_index {
+        None
+    } else {
+        let conn = match open_index_db_for_search() {
+            Ok(conn) => conn,
+            Err(_) => return Ok(None),
+        };
+        if !watch_state_covers_root(&conn, &root_key)? {
+            return Ok(None);
+        }
+        Some(conn)
     };
-    if !watch_state_covers_root(&status_conn, &root_key)? {
-        return Ok(None);
-    }
     let mut stream = match UnixStream::connect(&socket) {
         Ok(stream) => stream,
         Err(_) => return Ok(None),
@@ -839,6 +914,16 @@ pub(crate) fn run_indexed_via_daemon(
         Some(reader) => reader,
         None => return Ok(None),
     };
+    if opts.require_live_index {
+        let stdout = io::stdout();
+        let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
+        stage_strict_binary_results(&mut reader, &mut output)?;
+        return Ok(Some(SearchRun {
+            lines: Vec::new(),
+            timed_out: false,
+            incomplete: false,
+        }));
+    }
     let stdout_is_tty = io::stdout().is_terminal();
     let use_style = style_enabled(opts, stdout_is_tty);
     if opts.recent_limit.is_none() && can_stream_direct(opts, use_style) {
@@ -973,7 +1058,10 @@ pub(crate) fn run_indexed_via_daemon(
             cache,
             None,
             |items, cache| {
-                let _ = populate_indexed_dirsize_cache(&status_conn, &root_key, items, opts, cache);
+                if let Some(status_conn) = status_conn.as_ref() {
+                    let _ =
+                        populate_indexed_dirsize_cache(status_conn, &root_key, items, opts, cache);
+                }
             },
         ),
         timed_out: false,
@@ -1268,6 +1356,38 @@ pub(crate) fn clean_watcher_covers_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_binary_output_rejects_a_terminal() {
+        assert_eq!(
+            strict_binary_output_terminal_error(true),
+            Some("refusing to write strict binary index results to a terminal")
+        );
+        assert_eq!(strict_binary_output_terminal_error(false), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_binary_results_do_not_publish_truncated_streams() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let path = b"/root/complete";
+        let mut frame = vec![0];
+        frame.extend_from_slice(&i64::MIN.to_le_bytes());
+        frame.extend_from_slice(&i64::MIN.to_le_bytes());
+        frame.extend_from_slice(path);
+        server
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .and_then(|_| server.write_all(&frame))
+            .and_then(|_| server.write_all(&20u32.to_le_bytes()))
+            .and_then(|_| server.write_all(b"short"))
+            .expect("write partial response");
+        drop(server);
+
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+        assert!(stage_strict_binary_results(&mut reader, &mut output).is_err());
+        assert!(output.is_empty(), "partial candidates escaped staging");
+    }
 
     #[cfg(unix)]
     #[test]

@@ -85,6 +85,9 @@ pub(crate) fn scan_index_root_with_exclusions(
     cancel: Option<&'static AtomicBool>,
     exclusions: &Exclusions,
 ) -> Result<Vec<ScannedIndexEntry>, String> {
+    if exclusions.excludes(root, root, true) {
+        return Ok(Vec::new());
+    }
     let mut entries: Vec<ScannedIndexEntry> = WalkDir::new(root)
         .skip_hidden(false)
         .parallelism(super::workers::parallelism(threads))
@@ -291,19 +294,76 @@ fn load_existing_string_ids(
     if values.is_empty() {
         return Ok(HashMap::new());
     }
+    const LOOKUP_BATCH_SIZE: usize = 1_000;
     let values = values.iter().collect::<Vec<_>>();
-    let placeholders = std::iter::repeat_n("?", values.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT id, value FROM strings WHERE value IN ({placeholders})");
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params_from_iter(values), |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
-        })
-        .map_err(|e| e.to_string())?;
-    rows.map(|row| row.map_err(|e| e.to_string()))
-        .collect::<Result<HashMap<_, _>, _>>()
+    let mut ids = HashMap::new();
+    for batch in values.chunks(LOOKUP_BATCH_SIZE) {
+        let placeholders = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, value FROM strings WHERE value IN ({placeholders})");
+        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(batch.iter().copied()), |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (value, id) = row.map_err(|e| e.to_string())?;
+            ids.insert(value, id);
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod string_id_batch_tests {
+    use super::load_existing_string_ids;
+    use rusqlite::Connection;
+    use std::collections::HashSet;
+
+    #[test]
+    fn existing_string_lookup_chunks_more_than_sqlite_variable_limit() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch("CREATE TABLE strings(id INTEGER PRIMARY KEY, value TEXT UNIQUE)")
+            .expect("strings table");
+        let mut requested = HashSet::new();
+        for index in 0..33_000 {
+            let value = format!("basename-{index}");
+            if index % 2 == 0 {
+                conn.execute("INSERT INTO strings(value) VALUES (?1)", [&value])
+                    .expect("insert existing basename");
+            }
+            requested.insert(value);
+        }
+
+        let found = load_existing_string_ids(&conn, &requested).expect("bounded lookup");
+        assert_eq!(found.len(), 16_500);
+        assert!(found.contains_key("basename-0"));
+        assert!(found.contains_key("basename-32998"));
+        assert!(!found.contains_key("basename-1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_root_is_pruned_before_attempting_to_read_it() {
+        use super::super::super::Exclusions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let root = parent.path().join(".git");
+        std::fs::create_dir(&root).expect("excluded root");
+        std::fs::write(root.join("secret"), b"not scanned").expect("child");
+        let root_key = super::normalize_index_dir(&root);
+        let exclusions = Exclusions::from_lines("name\t.git").expect("valid root exclusion");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0))
+            .expect("make root unreadable");
+        let result = super::scan_index_root_with_exclusions(&root, &root_key, 1, None, &exclusions);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restore root permissions");
+
+        assert!(result.expect("excluded root is not read").is_empty());
+    }
 }
 
 pub(crate) fn next_index_id(conn: &Connection, table: &str) -> Result<i64, String> {

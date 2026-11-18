@@ -59,7 +59,7 @@ printf '%s\n' "$status" | grep -F "$ROOT" | grep -Fq $'\trunning\t' || {
 }
 backend="$(printf '%s\n' "$status" | grep -F "$ROOT" | head -n 1 | cut -f2)"
 if [[ "$backend" == "inotify" ]]; then
-	watch_count="$(grep -h '^inotify wd:' "/proc/$PID/fdinfo/"* 2>/dev/null | wc -l)"
+	watch_count="$(awk '/^inotify wd:/ { count++ } END { print count + 0 }' /proc/"$PID"/fdinfo/* 2>/dev/null)"
 	[[ "$watch_count" -eq 4 ]] || {
 		echo "expected four inotify watches (root, a, a/keep, keep), found $watch_count" >&2
 		exit 1
@@ -92,6 +92,9 @@ PY
 
 "$CLIENT_BIN" --require-live-index --hidden --index-binary '*' "$ROOT" >"$BASE/strict-live.bin"
 cmp "$BASE/results.bin" "$BASE/strict-live.bin"
+"$CLIENT_BIN" --require-live-index --hidden --full --lossless-paths --index-binary '*' "$ROOT" \
+	>"$BASE/strict-formatted.bin"
+[[ -s "$BASE/strict-formatted.bin" ]]
 "$CLIENT_BIN" --require-live-index --hidden --index-binary 'no-such-picker-entry-xyz' "$ROOT" >"$BASE/empty.bin"
 [[ ! -s "$BASE/empty.bin" ]]
 
@@ -136,16 +139,54 @@ PY
 	exit 1
 }
 
+wait_for_watch_count() {
+	local expected="$1"
+	[[ "$backend" == "inotify" ]] || return 0
+	for _ in $(seq 1 400); do
+		local count
+		count="$(awk '/^inotify wd:/ { count++ } END { print count + 0 }' /proc/"$PID"/fdinfo/* 2>/dev/null)"
+		[[ "$count" -eq "$expected" ]] && return
+		sleep 0.025
+	done
+	echo "timed out waiting for $expected inotify watches" >&2
+	exit 1
+}
+
+wait_for_clean_root() {
+	for _ in $(seq 1 400); do
+		local current
+		current="$("$CLIENT_BIN" --watch-status 2>/dev/null || true)"
+		if printf '%s\n' "$current" | grep -F "$ROOT" | grep -Fq $'dirty=0\tonline=1'; then
+			return
+		fi
+		sleep 0.025
+	done
+	echo "watch root did not return to clean state after move reconciliation" >&2
+	exit 1
+}
+
 # Exact-path exclusions must be reevaluated after a parent rename. The newly
 # included subtree must also gain inotify coverage after the move.
 mv "$ROOT/a" "$ROOT/b"
 wait_for_record "$ROOT/b/opaque/hidden" yes
+wait_for_watch_count 5
+wait_for_clean_root
 touch "$ROOT/b/opaque/new-file"
 wait_for_record "$ROOT/b/opaque/new-file" yes
 mv "$ROOT/b/opaque" "$ROOT/.git/opaque"
 wait_for_record "$ROOT/.git/opaque/hidden" no
+wait_for_watch_count 4
+wait_for_clean_root
 mv "$ROOT/.git/opaque" "$ROOT/b/opaque"
 wait_for_record "$ROOT/b/opaque/hidden" yes
+wait_for_watch_count 5
+mv "$ROOT/b" "$ROOT/a"
+wait_for_record "$ROOT/a/opaque/hidden" no
+wait_for_watch_count 4
+mv "$ROOT/a" "$ROOT/b"
+wait_for_record "$ROOT/b/opaque/hidden" yes
+wait_for_watch_count 5
+wait_for_clean_root
 
 # Dirty roots are unavailable to strict callers even while fsxd's socket stays
 # online. Restore the fixture before the normal shutdown path.
@@ -184,6 +225,23 @@ if "$CLIENT_BIN" --require-live-index --hidden --index-binary '*' "$ROOT" >"$BAS
 fi
 [[ ! -s "$BASE/unavailable.bin" ]]
 [[ ! -e "$DB" ]]
+
+STALE_CACHE="$BASE/stale-cache"
+STALE_SOCKET="$STALE_CACHE/fsx/index/fsxd.sock"
+mkdir -p "$(dirname "$STALE_SOCKET")"
+python3 - "$STALE_SOCKET" <<'PY'
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+if XDG_CACHE_HOME="$STALE_CACHE" "$CLIENT_BIN" --require-live-index --index-binary '*' "$ROOT" \
+	>"$BASE/stale-socket.bin" 2>"$BASE/stale-socket.err"; then
+	echo "strict query unexpectedly succeeded through a stale socket" >&2
+	exit 1
+fi
+[[ ! -s "$BASE/stale-socket.bin" ]]
+[[ ! -e "$STALE_CACHE/fsx/index/fsx.db" ]]
 
 BAD_CACHE="$BASE/bad-cache"
 BAD_CONFIG="$BASE/bad-config"

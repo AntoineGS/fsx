@@ -1606,6 +1606,20 @@ fn mark_reconciled(root: &str, backend: &str) -> Result<(), String> {
     mark_reconciled_status(root, backend, "running")
 }
 
+fn mark_root_recovering_in_tx(
+    tx: &Transaction<'_>,
+    root: &str,
+    last_event: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE watch_state SET dirty=1, status='recovering', last_event=?2, online=1
+         WHERE root=?1",
+        params![root, last_event],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn mark_initial_reconciled(root: &str, backend: &str) -> Result<(), String> {
     mark_reconciled_status(root, backend, "starting")
 }
@@ -1696,6 +1710,18 @@ fn process_batch(
         if event.action == Action::Move {
             metric_add(metrics.map(|metrics| &metrics.moves), 1);
             let mut changed_roots = HashSet::new();
+            if event.is_dir
+                && (old_root.is_some_and(|root| !root.exclusions.is_empty())
+                    || new_root.is_some_and(|root| !root.exclusions.is_empty()))
+            {
+                let mut roots_to_recover = HashSet::new();
+                for root in old_root.into_iter().chain(new_root) {
+                    if roots_to_recover.insert(root.key.as_str()) {
+                        mark_root_recovering_in_tx(&tx, &root.key, event.at)?;
+                        recovery_roots.insert(root.key.clone());
+                    }
+                }
+            }
             let old_key = event.old_path.as_deref().map(normalize_index_dir);
             let new_key = normalize_index_dir(&event.path);
             let old_is_indexed = old_root
@@ -4302,6 +4328,64 @@ fn mount_candidates(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn excluded_watcher_root_registers_no_inotify_watches() {
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let root = parent.path().join(".git");
+        fs::create_dir(&root).expect("excluded root");
+        fs::write(root.join("secret"), b"not watched").expect("child");
+        let exclusions = Exclusions::from_lines("name\t.git").expect("valid exclusion");
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut watcher = InotifyWatcher {
+            fd,
+            roots: vec![RootState {
+                key: normalize_index_dir(&root),
+                path: root.clone(),
+                exclusions: Arc::new(exclusions),
+            }],
+            paths: HashMap::new(),
+            path_to_wd: BTreeMap::new(),
+            pending_moves: HashMap::new(),
+            pending_self_moves: HashMap::new(),
+            recently_rebased: HashMap::new(),
+            mounted: HashSet::new(),
+            last_mount_check: Instant::now(),
+        };
+
+        let entries = watcher
+            .walk_recursive(&root, true, None, None)
+            .expect("scan excluded root")
+            .expect("unbounded scan");
+        assert!(entries.is_empty());
+        assert!(watcher.paths.is_empty());
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn configured_move_marks_watcher_roots_dirty_in_the_move_transaction() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE watch_state(root TEXT PRIMARY KEY, status TEXT, dirty INTEGER, last_event INTEGER, online INTEGER);
+             INSERT INTO watch_state VALUES ('/root', 'running', 0, NULL, 1);",
+        )
+        .expect("watch state table");
+        let tx = conn.transaction().expect("transaction");
+        mark_root_recovering_in_tx(&tx, "/root", 42).expect("mark dirty");
+        let (status, dirty, last_event): (String, i64, i64) = tx
+            .query_row(
+                "SELECT status, dirty, last_event FROM watch_state WHERE root='/root'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read state in transaction");
+        assert_eq!((status.as_str(), dirty, last_event), ("recovering", 1, 42));
+        tx.rollback().expect("rollback test transaction");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
