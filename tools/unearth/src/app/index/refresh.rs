@@ -356,7 +356,7 @@ mod string_id_batch_tests {
         std::fs::write(root.join("secret"), b"not scanned").expect("child");
         let root_key = super::normalize_index_dir(&root);
         let exclusions = Exclusions::from_lines("name\t.git").expect("valid root exclusion");
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
             .expect("make root unreadable");
         let result = super::scan_index_root_with_exclusions(&root, &root_key, 1, None, &exclusions);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))

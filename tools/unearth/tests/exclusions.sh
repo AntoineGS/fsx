@@ -92,6 +92,15 @@ PY
 
 "$CLIENT_BIN" --require-live-index --hidden --index-binary '*' "$ROOT" >"$BASE/strict-live.bin"
 cmp "$BASE/results.bin" "$BASE/strict-live.bin"
+"$CLIENT_BIN" --require-live-index --limit 1 --hidden --index-binary '*' "$ROOT" \
+	>"$BASE/strict-limited.bin"
+python3 - "$BASE/strict-limited.bin" <<'PY'
+import pathlib, struct, sys
+data = pathlib.Path(sys.argv[1]).read_bytes()
+assert len(data) >= 4
+size = struct.unpack_from("<I", data)[0]
+assert len(data) == 4 + size, "strict query ignored --limit 1"
+PY
 "$CLIENT_BIN" --require-live-index --hidden --full --lossless-paths --index-binary '*' "$ROOT" \
 	>"$BASE/strict-formatted.bin"
 [[ -s "$BASE/strict-formatted.bin" ]]
@@ -153,16 +162,32 @@ wait_for_watch_count() {
 }
 
 wait_for_clean_root() {
+	local stable=0
 	for _ in $(seq 1 400); do
 		local current
 		current="$("$CLIENT_BIN" --watch-status 2>/dev/null || true)"
 		if printf '%s\n' "$current" | grep -F "$ROOT" | grep -Fq $'dirty=0\tonline=1'; then
-			return
+			((stable += 1))
+			[[ "$stable" -ge 40 ]] && return
+		else
+			stable=0
 		fi
 		sleep 0.025
 	done
-	echo "watch root did not return to clean state after move reconciliation" >&2
+	echo "watch root did not remain clean after move reconciliation" >&2
 	exit 1
+}
+
+wait_for_dirty_root() {
+	for _ in $(seq 1 10); do
+		local current
+		current="$("$CLIENT_BIN" --watch-status 2>/dev/null || true)"
+		if ! printf '%s\n' "$current" | grep -F "$ROOT" | grep -Fq $'dirty=1\tonline=1'; then
+			echo "watch root did not remain dirty while checking strict query behavior" >&2
+			exit 1
+		fi
+		sleep 0.025
+	done
 }
 
 # Exact-path exclusions must be reevaluated after a parent rename. The newly
@@ -193,9 +218,13 @@ wait_for_clean_root
 python3 - "$DB" "$ROOT" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-con.execute("UPDATE watch_state SET dirty=1, status='recovering' WHERE root=?", (sys.argv[2],))
+updated = con.execute("UPDATE watch_state SET dirty=1, status='recovering' WHERE root=?", (sys.argv[2],)).rowcount
+assert updated == 1, (updated, list(con.execute("SELECT root, status, dirty FROM watch_state")))
 con.commit()
+state = con.execute("SELECT status, dirty FROM watch_state WHERE root=?", (sys.argv[2],)).fetchone()
+assert state == ("recovering", 1), state
 PY
+wait_for_dirty_root
 if "$CLIENT_BIN" --require-live-index --hidden --index-binary '*' "$ROOT" >"$BASE/dirty.bin" 2>"$BASE/dirty.err"; then
 	echo "strict live query unexpectedly succeeded for a dirty root" >&2
 	exit 1

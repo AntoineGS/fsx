@@ -1717,7 +1717,7 @@ fn process_batch(
                 let mut roots_to_recover = HashSet::new();
                 for root in old_root.into_iter().chain(new_root) {
                     if roots_to_recover.insert(root.key.as_str()) {
-                        mark_root_recovering_in_tx(&tx, &root.key, event.at)?;
+                        mark_root_recovering_in_tx(&tx, &root.key, now)?;
                         recovery_roots.insert(root.key.clone());
                     }
                 }
@@ -4375,7 +4375,8 @@ mod tests {
         )
         .expect("watch state table");
         let tx = conn.transaction().expect("transaction");
-        mark_root_recovering_in_tx(&tx, "/root", 42).expect("mark dirty");
+        const NOW_SECONDS: i64 = 1_795_040_259;
+        mark_root_recovering_in_tx(&tx, "/root", NOW_SECONDS).expect("mark dirty");
         let (status, dirty, last_event): (String, i64, i64) = tx
             .query_row(
                 "SELECT status, dirty, last_event FROM watch_state WHERE root='/root'",
@@ -4383,7 +4384,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read state in transaction");
-        assert_eq!((status.as_str(), dirty, last_event), ("recovering", 1, 42));
+        assert_eq!(
+            (status.as_str(), dirty, last_event),
+            ("recovering", 1, NOW_SECONDS)
+        );
         tx.rollback().expect("rollback test transaction");
     }
 

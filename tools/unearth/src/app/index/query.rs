@@ -7,8 +7,11 @@ use regex::RegexBuilder;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
+use std::time::Instant;
 
 const QUERY_CONSUMER_STOP: &str = "unearth query consumer stopped after limit";
+const STRICT_QUERY_MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
+const STRICT_QUERY_OVERALL_DEADLINE: Duration = Duration::from_secs(30);
 
 fn needs_recursive_indexed_dirsize(opts: &Options) -> bool {
     opts.sizes
@@ -114,6 +117,17 @@ pub(crate) fn write_binary_path_record<W: Write>(
     path: &str,
     path_encoded: bool,
 ) -> io::Result<()> {
+    let mut written = 0;
+    write_binary_path_record_bounded(writer, path, path_encoded, &mut written, None)
+}
+
+fn write_binary_path_record_bounded<W: Write>(
+    writer: &mut W,
+    path: &str,
+    path_encoded: bool,
+    written: &mut u64,
+    max_bytes: Option<u64>,
+) -> io::Result<()> {
     // SQLite stores lossless paths as escaped UTF-8 keys. Binary consumers
     // expect the original OS bytes, not the database representation.
     let decoded = path_encoded.then(|| fsx::decode_lossless_path(path));
@@ -123,67 +137,103 @@ pub(crate) fn write_binary_path_record<W: Write>(
         .unwrap_or_else(|| path.as_bytes());
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path too long"))?;
+    let record_size = 4u64 + bytes.len() as u64;
+    let next_written = written
+        .checked_add(record_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spool size overflow"))?;
+    if max_bytes.is_some_and(|max_bytes| next_written > max_bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "strict query spool byte limit exceeded",
+        ));
+    }
     writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(bytes)
+    writer.write_all(bytes)?;
+    *written = next_written;
+    Ok(())
 }
 
 struct StrictBinarySpool {
-    path: PathBuf,
-    file: File,
+    writer: BufWriter<File>,
+    written_bytes: u64,
+    max_bytes: u64,
 }
 
 impl StrictBinarySpool {
     fn create() -> Result<Self, String> {
-        for attempt in 0..100 {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            let path = env::temp_dir().join(format!(
-                "unearth-query-{}-{nonce}-{attempt}.bin",
-                std::process::id()
-            ));
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&path) {
-                Ok(file) => return Ok(Self { path, file }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(format!("cannot create strict query spool: {error}")),
-            }
-        }
-        Err("cannot allocate a unique strict query spool".to_string())
+        Self::create_in(&env::temp_dir())
+    }
+
+    fn create_in(directory: &Path) -> Result<Self, String> {
+        let file = tempfile::tempfile_in(directory)
+            .map_err(|error| format!("cannot create anonymous strict query spool: {error}"))?;
+        Ok(Self {
+            writer: BufWriter::with_capacity(128 * 1024, file),
+            written_bytes: 0,
+            max_bytes: STRICT_QUERY_MAX_SPOOL_BYTES,
+        })
+    }
+
+    fn append(&mut self, result: &SearchResult) -> Result<(), String> {
+        write_binary_path_record_bounded(
+            &mut self.writer,
+            &result.path,
+            result.path_encoded,
+            &mut self.written_bytes,
+            Some(self.max_bytes),
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn publish<W: Write>(&mut self, output: &mut W) -> Result<(), String> {
-        self.file.flush().map_err(|e| e.to_string())?;
-        self.file
-            .seek(io::SeekFrom::Start(0))
+        self.writer.flush().map_err(|e| e.to_string())?;
+        let file = self.writer.get_mut();
+        file.seek(io::SeekFrom::Start(0))
             .map_err(|e| e.to_string())?;
-        io::copy(&mut self.file, output).map_err(|e| e.to_string())?;
+        io::copy(file, output).map_err(|e| e.to_string())?;
         output.flush().map_err(|e| e.to_string())
-    }
-}
-
-impl Drop for StrictBinarySpool {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
 fn stage_strict_binary_results<W: Write>(
     reader: &mut BufReader<UnixStream>,
     output: &mut W,
+    limit: Option<usize>,
+    inactivity_timeout: Duration,
+    deadline: Instant,
+) -> Result<(), String> {
+    stage_strict_binary_results_with_limits(
+        reader,
+        output,
+        limit,
+        STRICT_QUERY_MAX_SPOOL_BYTES,
+        deadline,
+        inactivity_timeout,
+    )
+}
+
+fn stage_strict_binary_results_with_limits<W: Write>(
+    reader: &mut BufReader<UnixStream>,
+    output: &mut W,
+    limit: Option<usize>,
+    max_bytes: u64,
+    deadline: Instant,
+    inactivity_timeout: Duration,
 ) -> Result<(), String> {
     let mut spool = StrictBinarySpool::create()?;
-    read_query_results(reader, |result| {
-        write_binary_path_record(&mut spool.file, &result.path, result.path_encoded)
-            .map_err(|error| error.to_string())
+    spool.max_bytes = max_bytes;
+    let mut emitted = 0usize;
+    read_query_results_with_deadline(reader, deadline, inactivity_timeout, |result| {
+        if limit.is_some_and(|limit| emitted >= limit) {
+            return Ok(());
+        }
+        spool.append(&result)?;
+        emitted += 1;
+        Ok(())
     })?;
+    if Instant::now() >= deadline {
+        return Err("strict query timed out".to_string());
+    }
     spool.publish(output)
 }
 
@@ -793,16 +843,61 @@ where
 pub(crate) fn begin_query_results(
     stream: UnixStream,
 ) -> Result<Option<BufReader<UnixStream>>, String> {
+    begin_query_results_inner(stream, None)
+}
+
+fn begin_query_results_with_deadline(
+    stream: UnixStream,
+    deadline: Instant,
+    inactivity_timeout: Duration,
+) -> Result<Option<BufReader<UnixStream>>, String> {
+    begin_query_results_inner(stream, Some((deadline, inactivity_timeout)))
+}
+
+fn begin_query_results_inner(
+    stream: UnixStream,
+    timeout: Option<(Instant, Duration)>,
+) -> Result<Option<BufReader<UnixStream>>, String> {
     let mut reader = BufReader::new(stream);
     let mut magic = [0u8; 8];
-    if reader.read_exact(&mut magic).is_err() || &magic != QUERY_RESPONSE_MAGIC {
+    let magic_result = match timeout {
+        Some(timeout) => read_query_exact(&mut reader, &mut magic, Some(timeout)),
+        None => reader.read_exact(&mut magic),
+    };
+    if let Err(error) = magic_result {
+        if timeout.is_some() {
+            return Err(error.to_string());
+        }
+        return Ok(None);
+    }
+    if &magic != QUERY_RESPONSE_MAGIC {
         return Ok(None);
     }
     let mut status = [0u8; 1];
-    if reader.read_exact(&mut status).is_err() {
+    let status_result = match timeout {
+        Some(timeout) => read_query_exact(&mut reader, &mut status, Some(timeout)),
+        None => reader.read_exact(&mut status),
+    };
+    if let Err(error) = status_result {
+        if timeout.is_some() {
+            return Err(error.to_string());
+        }
         return Ok(None);
     }
     if status[0] != 0 {
+        if let Some(timeout) = timeout {
+            let mut length = [0u8; 4];
+            read_query_exact(&mut reader, &mut length, Some(timeout))
+                .map_err(|error| error.to_string())?;
+            let length = u32::from_le_bytes(length) as usize;
+            if length > QUERY_MAX_FRAME {
+                return Err("query string exceeds protocol limit".to_string());
+            }
+            let mut bytes = vec![0u8; length];
+            read_query_exact(&mut reader, &mut bytes, Some(timeout))
+                .map_err(|error| error.to_string())?;
+            return Err(String::from_utf8(bytes).map_err(|error| error.to_string())?);
+        }
         return Err(read_query_string(&mut reader)?);
     }
     Ok(Some(reader))
@@ -810,14 +905,37 @@ pub(crate) fn begin_query_results(
 
 pub(crate) fn read_query_results<F>(
     reader: &mut BufReader<UnixStream>,
+    emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(SearchResult) -> Result<(), String>,
+{
+    read_query_results_inner(reader, emit, None)
+}
+
+fn read_query_results_with_deadline<F>(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    inactivity_timeout: Duration,
+    emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(SearchResult) -> Result<(), String>,
+{
+    read_query_results_inner(reader, emit, Some((deadline, inactivity_timeout)))
+}
+
+fn read_query_results_inner<F>(
+    reader: &mut BufReader<UnixStream>,
     mut emit: F,
+    timeout: Option<(Instant, Duration)>,
 ) -> Result<(), String>
 where
     F: FnMut(SearchResult) -> Result<(), String>,
 {
     loop {
         let mut length = [0u8; 4];
-        reader.read_exact(&mut length).map_err(|e| e.to_string())?;
+        read_query_exact(reader, &mut length, timeout).map_err(|e| e.to_string())?;
         let length = u32::from_le_bytes(length) as usize;
         if length == 0 {
             break;
@@ -826,7 +944,7 @@ where
             return Err("invalid fsxd query result frame".to_string());
         }
         let mut frame = vec![0u8; length];
-        reader.read_exact(&mut frame).map_err(|e| e.to_string())?;
+        read_query_exact(reader, &mut frame, timeout).map_err(|e| e.to_string())?;
         let is_dir = frame[0] & 1 != 0;
         let is_symlink = frame[0] & 2 != 0;
         let activity = i64::from_le_bytes(
@@ -849,6 +967,55 @@ where
             indexed_activity_nanos: (activity != i64::MIN).then_some(activity),
             indexed_size: (size >= 0 && size != i64::MIN).then_some(size as u64),
         })?;
+    }
+    Ok(())
+}
+
+fn read_query_exact(
+    reader: &mut BufReader<UnixStream>,
+    buffer: &mut [u8],
+    timeout: Option<(Instant, Duration)>,
+) -> io::Result<()> {
+    let Some((deadline, inactivity_timeout)) = timeout else {
+        return reader.read_exact(buffer);
+    };
+
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "strict query timed out",
+            ));
+        }
+        if reader.buffer().is_empty() {
+            reader
+                .get_ref()
+                .set_read_timeout(Some(inactivity_timeout.min(remaining)))?;
+        }
+        match reader.read(&mut buffer[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of strict query response",
+                ))
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "strict query timed out",
+                ))
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -907,17 +1074,30 @@ pub(crate) fn run_indexed_via_daemon(
     stream
         .set_read_timeout(Some(opts.timeout_dur))
         .map_err(|e| e.to_string())?;
+    let strict_deadline = opts
+        .require_live_index
+        .then(|| Instant::now() + STRICT_QUERY_OVERALL_DEADLINE);
     if write_query_request(&mut stream, opts, &root, &terms).is_err() {
         return Ok(None);
     }
-    let mut reader = match begin_query_results(stream)? {
+    let reader = match strict_deadline {
+        Some(deadline) => begin_query_results_with_deadline(stream, deadline, opts.timeout_dur)?,
+        None => begin_query_results(stream)?,
+    };
+    let mut reader = match reader {
         Some(reader) => reader,
         None => return Ok(None),
     };
     if opts.require_live_index {
         let stdout = io::stdout();
         let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
-        stage_strict_binary_results(&mut reader, &mut output)?;
+        stage_strict_binary_results(
+            &mut reader,
+            &mut output,
+            opts.limit,
+            opts.timeout_dur,
+            strict_deadline.expect("strict request has a deadline"),
+        )?;
         return Ok(Some(SearchRun {
             lines: Vec::new(),
             timed_out: false,
@@ -1356,6 +1536,7 @@ pub(crate) fn clean_watcher_covers_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn strict_binary_output_rejects_a_terminal() {
@@ -1364,6 +1545,125 @@ mod tests {
             Some("refusing to write strict binary index results to a terminal")
         );
         assert_eq!(strict_binary_output_terminal_error(false), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_staging_honors_limit_but_consumes_the_terminator() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, b"/first");
+        write_test_query_result(&mut server, b"/second");
+        server.write_all(&0u32.to_le_bytes()).expect("terminator");
+        drop(server);
+
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+        stage_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            Some(1),
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("stage limited query");
+
+        let mut expected = Vec::new();
+        write_binary_path_record(&mut expected, "/first", true).expect("expected record");
+        assert_eq!(output, expected);
+        let mut trailing = [0; 1];
+        assert_eq!(reader.read(&mut trailing).expect("terminator consumed"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_staging_rejects_record_before_exceeding_byte_budget() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, b"/too-large");
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+
+        let result = stage_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            4 + b"/too-large".len() as u64 - 1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+
+        assert!(result.unwrap_err().contains("byte limit"));
+        assert!(output.is_empty(), "over-budget data was published");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_staging_enforces_an_overall_deadline() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let sender = std::thread::spawn(move || {
+            for byte in 0u32.to_le_bytes() {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+        let started = Instant::now();
+
+        let result = stage_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            started + Duration::from_millis(25),
+            Duration::from_secs(1),
+        );
+
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(output.is_empty());
+        sender.join().expect("sender thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_spool_is_anonymous_and_released_on_drop() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        {
+            let spool = StrictBinarySpool::create_in(directory.path()).expect("anonymous spool");
+            assert!(directory
+                .path()
+                .read_dir()
+                .expect("list directory")
+                .next()
+                .is_none());
+            assert!(spool
+                .writer
+                .get_ref()
+                .metadata()
+                .expect("open file metadata")
+                .is_file());
+        }
+        assert!(directory
+            .path()
+            .read_dir()
+            .expect("list directory")
+            .next()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    fn write_test_query_result(writer: &mut UnixStream, path: &[u8]) {
+        let mut frame = vec![0];
+        frame.extend_from_slice(&i64::MIN.to_le_bytes());
+        frame.extend_from_slice(&i64::MIN.to_le_bytes());
+        frame.extend_from_slice(path);
+        writer
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .and_then(|_| writer.write_all(&frame))
+            .expect("write query result");
     }
 
     #[cfg(unix)]
@@ -1385,7 +1685,14 @@ mod tests {
 
         let mut reader = BufReader::new(client);
         let mut output = Vec::new();
-        assert!(stage_strict_binary_results(&mut reader, &mut output).is_err());
+        assert!(stage_strict_binary_results(
+            &mut reader,
+            &mut output,
+            None,
+            Duration::from_millis(100),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .is_err());
         assert!(output.is_empty(), "partial candidates escaped staging");
     }
 
