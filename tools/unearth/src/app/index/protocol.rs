@@ -81,6 +81,9 @@ pub(crate) fn write_query_request(
     if opts.limit.is_some() {
         flags |= 1 << 6;
     }
+    if opts.require_live_index {
+        flags |= 1 << 7;
+    }
     stream
         .write_all(QUERY_PROTOCOL_MAGIC)
         .and_then(|_| stream.write_all(&[flags]))
@@ -132,9 +135,6 @@ pub(crate) fn read_query_request(reader: &mut BufReader<UnixStream>) -> Result<O
     }
     let mut flags = [0u8; 1];
     reader.read_exact(&mut flags).map_err(|e| e.to_string())?;
-    if flags[0] & !0x7f != 0 {
-        return Err("invalid unearth query flags".to_string());
-    }
     let mut recent_limit = [0u8; 8];
     reader
         .read_exact(&mut recent_limit)
@@ -229,7 +229,9 @@ pub(crate) fn read_query_request(reader: &mut BufReader<UnixStream>) -> Result<O
         }
         args.extend(["--limit".to_string(), limit.to_string()]);
     }
-    parse_args_from(args)
+    let mut opts = parse_args_from(args)?;
+    opts.require_live_index = flags[0] & (1 << 7) != 0;
+    Ok(opts)
 }
 
 #[cfg(feature = "watcher")]
@@ -297,6 +299,37 @@ pub(crate) fn handle_query_connection(
             return Ok(());
         }
     };
+    if opts.require_live_index {
+        let root = opts
+            .positional
+            .last()
+            .ok_or_else(|| "strict live query has no root".to_string())?;
+        let root_key = normalize_index_dir(Path::new(root));
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        if !watch_state_covers_root(&tx, &root_key)? {
+            write_query_error(&mut stream, "clean live index is unavailable")?;
+            return Ok(());
+        }
+        stream
+            .write_all(QUERY_RESPONSE_MAGIC)
+            .and_then(|_| stream.write_all(&[0]))
+            .map_err(|e| e.to_string())?;
+        let result = if opts.recent_limit.is_some() {
+            query_recent_rows(&opts, &tx, |result| {
+                write_query_record(&mut stream, &result)
+            })
+        } else {
+            query_indexed_rows(&opts, None, &tx, |result| {
+                write_query_record(&mut stream, &result)
+            })
+        };
+        result?;
+        stream
+            .write_all(&0u32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     stream
         .write_all(QUERY_RESPONSE_MAGIC)
         .and_then(|_| stream.write_all(&[0]))

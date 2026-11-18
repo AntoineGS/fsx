@@ -67,17 +67,31 @@ fn reject_child_read_error(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn scan_index_root_cancellable(
     root: &Path,
     root_key: &str,
     threads: usize,
     cancel: Option<&'static AtomicBool>,
 ) -> Result<Vec<ScannedIndexEntry>, String> {
+    let exclusions = Exclusions::load()?;
+    scan_index_root_with_exclusions(root, root_key, threads, cancel, &exclusions)
+}
+
+pub(crate) fn scan_index_root_with_exclusions(
+    root: &Path,
+    root_key: &str,
+    threads: usize,
+    cancel: Option<&'static AtomicBool>,
+    exclusions: &Exclusions,
+) -> Result<Vec<ScannedIndexEntry>, String> {
     let mut entries: Vec<ScannedIndexEntry> = WalkDir::new(root)
         .skip_hidden(false)
         .parallelism(super::workers::parallelism(threads))
         .process_read_dir({
             let root_key = root_key.to_string();
+            let root_path = root.to_path_buf();
+            let exclusions = exclusions.clone();
             move |_depth, _path, _state, children| {
                 if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                     children.clear();
@@ -85,7 +99,9 @@ pub(crate) fn scan_index_root_cancellable(
                 }
                 for entry in children.iter_mut().flatten() {
                     if let Some(child_path) = entry.read_children_path.as_ref() {
-                        if is_root_index_prune_child(&root_key, child_path.as_ref()) {
+                        if is_root_index_prune_child(&root_key, child_path.as_ref())
+                            || exclusions.excludes(&root_path, child_path, true)
+                        {
                             entry.read_children_path = None;
                         }
                     }
@@ -102,6 +118,7 @@ pub(crate) fn scan_index_root_cancellable(
                 Err(error) => return Some(Err(error.to_string())),
             };
             let path = entry.path();
+            let file_type = entry.file_type();
             if let Err(error) = reject_child_read_error(
                 &path,
                 entry
@@ -114,11 +131,13 @@ pub(crate) fn scan_index_root_cancellable(
             if path == root || path.file_name().is_none() || path.parent().is_none() {
                 return None;
             }
+            if exclusions.excludes(root, &path, file_type.is_dir()) {
+                return None;
+            }
             let path = normalize_index_dir(&path);
             if is_root_index_excluded_path(root_key, &path) {
                 return None;
             }
-            let file_type = entry.file_type();
             let kind = if file_type.is_dir() {
                 1
             } else if file_type.is_symlink() {
@@ -1259,13 +1278,38 @@ pub(crate) fn refresh_index_root_cancellable(
     opts: &Options,
     cancel: Option<&'static AtomicBool>,
 ) -> Result<(), String> {
-    refresh_index_root_path_cancellable(Path::new(&expand_home_path(root_raw)), opts, cancel)
+    let exclusions = Exclusions::load()?;
+    refresh_index_root_cancellable_with_exclusions(root_raw, opts, cancel, &exclusions)
+}
+
+pub(crate) fn refresh_index_root_cancellable_with_exclusions(
+    root_raw: &str,
+    opts: &Options,
+    cancel: Option<&'static AtomicBool>,
+    exclusions: &Exclusions,
+) -> Result<(), String> {
+    refresh_index_root_path_with_exclusions_cancellable(
+        Path::new(&expand_home_path(root_raw)),
+        opts,
+        cancel,
+        exclusions,
+    )
 }
 
 fn refresh_index_root_path_cancellable(
     root_raw: &Path,
     opts: &Options,
     cancel: Option<&'static AtomicBool>,
+) -> Result<(), String> {
+    let exclusions = Exclusions::load()?;
+    refresh_index_root_path_with_exclusions_cancellable(root_raw, opts, cancel, &exclusions)
+}
+
+fn refresh_index_root_path_with_exclusions_cancellable(
+    root_raw: &Path,
+    opts: &Options,
+    cancel: Option<&'static AtomicBool>,
+    exclusions: &Exclusions,
 ) -> Result<(), String> {
     let root = fs::canonicalize(expand_home_path_os(root_raw)).map_err(|e| e.to_string())?;
     if !root.is_dir() {
@@ -1291,7 +1335,8 @@ fn refresh_index_root_path_cancellable(
     } else {
         opts.threads_override.max(1)
     };
-    let scanned_entries = scan_index_root_cancellable(&root, &root_key, scan_threads, cancel)?;
+    let scanned_entries =
+        scan_index_root_with_exclusions(&root, &root_key, scan_threads, cancel, exclusions)?;
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         return Err("index scan interrupted".to_string());
     }

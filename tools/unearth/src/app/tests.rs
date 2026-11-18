@@ -34,6 +34,7 @@ fn base_opts() -> Options {
         snapshot_cache: false,
         snapshot_refresh: false,
         live_only: false,
+        require_live_index: false,
         index_mode: false,
         index_if_watched: false,
         index_binary: false,

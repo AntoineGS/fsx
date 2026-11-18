@@ -47,6 +47,13 @@ are escaped as `%25` and invalid Unix bytes are encoded as `%XX`. The representa
 directory separators and round-trips to the original `PathBuf`, so non-UTF-8 names remain
 searchable and usable by the watcher. `--index-binary` decodes those keys and writes a
 length-prefixed record containing the original path bytes rather than the escaped database text.
+Add `--require-live-index` to make a binary indexed query daemon-only: it fails with no output if
+there is no clean compatible live watcher, and never falls back to a local database query or scan.
+
+`fsxd` and standalone `--index-refresh` read `$XDG_CONFIG_HOME/fsx/excludes.tsv` (or
+`~/.config/fsx/excludes.tsv`). Each non-comment line is `path<TAB>/absolute/path`,
+`name<TAB>basename`, or `regex<TAB>basename-regex`. Rules are validated before indexing;
+excluded directories and their descendants are omitted from scans and live updates.
 
 All path-bearing command-line operands, maintenance roots, watcher roots, and `--watch-metrics`
 outputs retain their `OsString` form through argument parsing. UTF-8 conversion is limited to
@@ -244,7 +251,8 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache] [--live|--no-index]
-                       [--index|--index-if-watched] [--index-binary]
+                        [--index|--index-if-watched] [--index-binary]
+                        [--require-live-index]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]

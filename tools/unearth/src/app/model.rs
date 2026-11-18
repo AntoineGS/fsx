@@ -77,6 +77,7 @@ pub(crate) struct Options {
     /// Force a live filesystem traversal. This suppresses all index access,
     /// including the implicit watcher-backed path used by full-path searches.
     pub(crate) live_only: bool,
+    pub(crate) require_live_index: bool,
     pub(crate) index_mode: bool,
     pub(crate) index_if_watched: bool,
     pub(crate) index_binary: bool,

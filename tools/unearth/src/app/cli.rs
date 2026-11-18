@@ -3,8 +3,9 @@ use super::filesystem::effective_threads_override;
 use super::index::{
     clean_watcher_covers_search, print_watch_status, print_watch_status_json, purge_index_root,
     purge_index_root_path, rebuild_index_snapshot, rebuild_index_snapshot_path, refresh_index_root,
-    refresh_index_root_path, run_indexed, run_recent_indexed, snapshot_cache_path,
-    snapshot_lock_path, spawn_snapshot_refresh, stream_snapshot_cache, write_snapshot_cache,
+    refresh_index_root_path, run_indexed, run_indexed_via_daemon, run_recent_indexed,
+    snapshot_cache_path, snapshot_lock_path, spawn_snapshot_refresh, stream_snapshot_cache,
+    write_snapshot_cache,
 };
 use super::model::{ColorWhen, DirStatsCache, Options, SortField, SortOrder};
 use super::patterns::contains_all_spec_from_opts;
@@ -49,7 +50,7 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache] [--live|--no-index]
-                       [--index|--index-if-watched] [--index-binary]
+                        [--index|--index-if-watched] [--index-binary] [--require-live-index]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
@@ -138,8 +139,10 @@ Arguments:
     fall back to the live filesystem size walker.
     Full-path (-F) searches use the same fallback automatically when a clean
     watcher covers the root; --index-if-watched remains available explicitly.
-  - --index-binary writes --index results as repeated little-endian
-    u32-length-prefixed path bytes instead of newline-delimited text.
+   - --index-binary writes --index results as repeated little-endian
+     u32-length-prefixed path bytes instead of newline-delimited text; directory
+     paths retain their trailing slash marker. --require-live-index restricts
+     binary queries to a clean live daemon and never falls back to local data or a walk.
   - --case-sensitive disables the default case-insensitive pattern matching.
   - --lossless-paths percent-encodes invalid filename bytes as %XX in textual
     output so paths can be transported without replacement characters.
@@ -395,6 +398,7 @@ where
         snapshot_cache: false,
         snapshot_refresh: false,
         live_only: false,
+        require_live_index: false,
         index_mode: false,
         index_if_watched: false,
         index_binary: false,
@@ -633,6 +637,7 @@ where
             "--snapshot-cache" => opts.snapshot_cache = true,
             "--snapshot-refresh" => opts.snapshot_refresh = true,
             "--live" | "--no-index" => opts.live_only = true,
+            "--require-live-index" => opts.require_live_index = true,
             "--index" => opts.index_mode = true,
             "--index-if-watched" => opts.index_if_watched = true,
             "--index-binary" => {
@@ -846,6 +851,26 @@ where
                 .to_string(),
         );
     }
+    if opts.require_live_index && !opts.index_binary {
+        return Err("--require-live-index requires --index-binary".to_string());
+    }
+    if opts.require_live_index
+        && (opts.index_if_watched
+            || opts.recent_limit.is_some()
+            || opts.index_refresh.is_some()
+            || opts.index_snapshot.is_some()
+            || opts.index_purge.is_some()
+            || opts.watch
+            || opts.watch_status
+            || opts.snapshot_cache
+            || opts.snapshot_refresh
+            || opts.contains_all)
+    {
+        return Err(
+            "--require-live-index cannot be combined with maintenance, recent, or snapshot modes"
+                .to_string(),
+        );
+    }
     if !cfg!(feature = "index")
         && (opts.index_mode
             || opts.index_if_watched
@@ -977,6 +1002,30 @@ pub(crate) fn cli_main() -> ExitCode {
     }
     if opts.watch {
         return run_watch(&opts);
+    }
+    #[cfg(feature = "index")]
+    if opts.require_live_index {
+        let result = run_indexed_via_daemon(
+            &opts,
+            None,
+            &mut DirStatsCache::default(),
+            &default_color_spec(),
+        );
+        return match result {
+            Ok(Some(run)) if !run.timed_out && !run.incomplete => ExitCode::SUCCESS,
+            Ok(Some(_)) => {
+                eprintln!("unearth: live indexed query was incomplete");
+                ExitCode::from(1)
+            }
+            Ok(None) => {
+                eprintln!("unearth: clean live index is unavailable");
+                ExitCode::from(1)
+            }
+            Err(error) => {
+                eprintln!("unearth: live indexed query failed: {error}");
+                ExitCode::from(1)
+            }
+        };
     }
     #[cfg(feature = "index")]
     let snapshot_path = if opts.snapshot_cache || opts.snapshot_refresh {
@@ -1237,6 +1286,49 @@ mod tests {
         .expect_err("conflicting live/index modes");
 
         assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn strict_live_index_option_requires_binary_index_mode() {
+        let options = parse_args_from(
+            ["--require-live-index", "--index-binary", "*", "/tmp"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("strict live index options");
+        assert!(options.require_live_index);
+        assert!(options.index_binary);
+
+        let error = parse_args_from(
+            ["--require-live-index", "needle", "/tmp"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("strict live index requires binary indexed query");
+        assert!(error.contains("--index-binary"));
+    }
+
+    #[test]
+    fn strict_live_index_rejects_maintenance_and_recent_modes() {
+        for arguments in [
+            vec![
+                "--require-live-index",
+                "--index-binary",
+                "--index-refresh",
+                "/tmp",
+            ],
+            vec![
+                "--require-live-index",
+                "--index-binary",
+                "--recent",
+                "5",
+                "/tmp",
+            ],
+        ] {
+            let error =
+                parse_args_from(arguments.into_iter().map(str::to_string)).expect_err("conflict");
+            assert!(error.contains("--require-live-index"), "{error}");
+        }
     }
 
     #[test]

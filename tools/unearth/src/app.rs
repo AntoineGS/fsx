@@ -5,6 +5,7 @@ mod watcher;
 
 mod aggregate;
 mod cli;
+mod exclusions;
 mod filesystem;
 #[cfg(feature = "index")]
 mod index;
@@ -15,6 +16,7 @@ mod scan_status;
 mod search;
 
 pub(crate) use cli::{cli_main, fsxd_main};
+pub(crate) use exclusions::Exclusions;
 #[allow(unused_imports)]
 pub(crate) use filesystem::*;
 #[cfg(feature = "index")]

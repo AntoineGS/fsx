@@ -709,6 +709,7 @@ impl EventReceiver {
 struct RootState {
     key: String,
     path: PathBuf,
+    exclusions: Arc<Exclusions>,
 }
 
 type InitialScans = HashMap<String, Vec<ScannedIndexEntry>>;
@@ -1074,6 +1075,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     if opts.positional.is_empty() {
         return Err("--watch requires at least one directory root".to_string());
     }
+    let exclusions = Arc::new(Exclusions::load()?);
     let _ = initialize_index_db()?;
     let mut roots = Vec::new();
     for (index, raw) in opts.positional.iter().enumerate() {
@@ -1087,7 +1089,11 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         }
         let key = normalize_index_dir(&path);
         if !roots.iter().any(|root: &RootState| root.key == key) {
-            roots.push(RootState { key, path });
+            roots.push(RootState {
+                key,
+                path,
+                exclusions: Arc::clone(&exclusions),
+            });
         }
     }
     if roots.is_empty() {
@@ -1213,7 +1219,12 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
                 refresh_index_root_from_scan(&root.key, entries)
             }
         } else {
-            refresh_index_root_cancellable(&root.key, opts, Some(&WATCH_STOP))
+            refresh_index_root_cancellable_with_exclusions(
+                &root.key,
+                opts,
+                Some(&WATCH_STOP),
+                &root.exclusions,
+            )
         };
         metric_add(
             metrics_counters
@@ -1316,7 +1327,13 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         {
             for root in &roots {
                 let started = Instant::now();
-                let result = reconcile_subtree(&mut event_conn, &root.path, opts, &mut db_caches);
+                let result = reconcile_subtree(
+                    &mut event_conn,
+                    &root.path,
+                    opts,
+                    &mut db_caches,
+                    &root.exclusions,
+                );
                 metric_add(
                     metrics_counters
                         .as_deref()
@@ -1441,7 +1458,12 @@ fn process_batch_reliably(
                 let _ = update_state_error(&root.key, backend, &batch_error);
                 db_caches.clear();
                 let started = Instant::now();
-                let result = refresh_index_root_cancellable(&root.key, opts, Some(&WATCH_STOP));
+                let result = refresh_index_root_cancellable_with_exclusions(
+                    &root.key,
+                    opts,
+                    Some(&WATCH_STOP),
+                    &root.exclusions,
+                );
                 metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
                 metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
                 db_caches.clear();
@@ -1678,12 +1700,25 @@ fn process_batch(
             let new_key = normalize_index_dir(&event.path);
             let old_is_indexed = old_root
                 .zip(old_key.as_deref())
-                .is_some_and(|(root, path)| !is_root_index_excluded_path(&root.key, path));
-            let new_is_indexed =
-                new_root.is_some_and(|root| !is_root_index_excluded_path(&root.key, &new_key));
+                .is_some_and(|(root, path)| {
+                    !is_root_index_excluded_path(&root.key, path)
+                        && !root.exclusions.excludes(
+                            &root.path,
+                            event.old_path.as_deref().unwrap(),
+                            event.is_dir,
+                        )
+                });
+            let new_is_indexed = new_root.is_some_and(|root| {
+                !is_root_index_excluded_path(&root.key, &new_key)
+                    && !root
+                        .exclusions
+                        .excludes(&root.path, &event.path, event.is_dir)
+            });
             if event.is_dir
                 && old_is_indexed
                 && new_is_indexed
+                && old_root.is_some_and(|root| root.exclusions.is_empty())
+                && new_root.is_some_and(|root| root.exclusions.is_empty())
                 && move_indexed_directory(
                     &tx,
                     event.old_path.as_deref().unwrap(),
@@ -1770,7 +1805,11 @@ fn process_batch(
         let Some(root) = new_root else {
             continue;
         };
-        if is_root_index_excluded_path(&root.key, &normalize_index_dir(&event.path)) {
+        if is_root_index_excluded_path(&root.key, &normalize_index_dir(&event.path))
+            || root
+                .exclusions
+                .excludes(&root.path, &event.path, event.is_dir)
+        {
             continue;
         }
         match event.action {
@@ -1927,7 +1966,15 @@ fn process_batch(
             };
             reconcile_subtree_from_entries(conn, &path, entries, db_caches)
         } else {
-            reconcile_subtree(conn, &path, opts, db_caches)
+            let exclusions = matching_root(roots, &path)
+                .map(|root| root.exclusions.as_ref())
+                .ok_or_else(|| {
+                    format!(
+                        "no watcher root covers reconciliation path {}",
+                        path.display()
+                    )
+                })?;
+            reconcile_subtree(conn, &path, opts, db_caches, exclusions)
         };
         metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
@@ -1943,7 +1990,17 @@ fn process_batch(
     for root in full_refresh {
         db_caches.clear();
         let started = Instant::now();
-        let result = refresh_index_root_cancellable(&root, opts, Some(&WATCH_STOP));
+        let exclusions = roots
+            .iter()
+            .find(|watch_root| watch_root.key == root)
+            .map(|watch_root| watch_root.exclusions.as_ref())
+            .ok_or_else(|| format!("no watcher root found for recovery {root}"))?;
+        let result = refresh_index_root_cancellable_with_exclusions(
+            &root,
+            opts,
+            Some(&WATCH_STOP),
+            exclusions,
+        );
         db_caches.clear();
         metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
@@ -2471,6 +2528,7 @@ fn reconcile_subtree(
     path: &Path,
     opts: &Options,
     caches: &mut DbCaches,
+    exclusions: &Exclusions,
 ) -> Result<(), String> {
     let path = path.to_path_buf();
     let metadata = match fs::symlink_metadata(&path) {
@@ -2505,7 +2563,8 @@ fn reconcile_subtree(
     } else {
         opts.threads_override.max(1)
     };
-    let entries = scan_index_root_cancellable(&path, &root_key, threads, Some(&WATCH_STOP))?;
+    let entries =
+        scan_index_root_with_exclusions(&path, &root_key, threads, Some(&WATCH_STOP), exclusions)?;
     reconcile_subtree_from_entries(conn, &path, entries, caches)
 }
 
@@ -2892,9 +2951,10 @@ impl InotifyWatcher {
                 return Err("watcher interrupted during initial watch scan".to_string());
             }
             let directory_key = normalize_index_dir(&directory);
-            let Some(excluded) = matching_root(&self.roots, &directory)
-                .map(|matched| is_root_index_excluded_path(&matched.key, &directory_key))
-            else {
+            let Some(excluded) = matching_root(&self.roots, &directory).map(|matched| {
+                is_root_index_excluded_path(&matched.key, &directory_key)
+                    || matched.exclusions.excludes(&matched.path, &directory, true)
+            }) else {
                 continue;
             };
             if excluded {
@@ -2923,19 +2983,22 @@ impl InotifyWatcher {
                     continue;
                 }
                 let path_key = normalize_index_dir(&path);
-                let Some(excluded) = matching_root(&self.roots, &path)
-                    .map(|matched| is_root_index_excluded_path(&matched.key, &path_key))
-                else {
-                    continue;
-                };
-                if excluded {
-                    continue;
-                }
                 let file_type = match child.file_type() {
                     Ok(file_type) => file_type,
                     Err(error) if transient_watch_path_error(&error) => continue,
                     Err(error) => return Err(error.to_string()),
                 };
+                let Some(excluded) = matching_root(&self.roots, &path).map(|matched| {
+                    is_root_index_excluded_path(&matched.key, &path_key)
+                        || matched
+                            .exclusions
+                            .excludes(&matched.path, &path, file_type.is_dir())
+                }) else {
+                    continue;
+                };
+                if excluded {
+                    continue;
+                }
                 if file_type.is_dir() {
                     pending.push(path.clone());
                 }
@@ -3280,11 +3343,17 @@ impl InotifyWatcher {
                         let destination_is_watched =
                             matching_root(&self.roots, &path).is_some_and(|root| {
                                 !is_root_index_excluded_path(&root.key, &normalize_index_dir(&path))
+                                    && !root.exclusions.excludes(
+                                        &root.path,
+                                        &path,
+                                        is_dir || old.is_dir,
+                                    )
                             });
                         if destination_is_watched {
-                            let watch_coverage_rebased =
-                                self.update_watches_after_move(&old.path, &path);
-                            if (is_dir || old.is_dir) && !watch_coverage_rebased {
+                            let exclusions_apply = matching_root(&self.roots, &path)
+                                .is_some_and(|root| !root.exclusions.is_empty());
+                            if exclusions_apply && (is_dir || old.is_dir) {
+                                self.remove_watches_below(&old.path);
                                 if let Err(error) = self.add_recursive(&path) {
                                     let _ = tx.send(event(
                                         Action::Overflow,
@@ -3298,6 +3367,25 @@ impl InotifyWatcher {
                                         path.display()
                                     );
                                     break 'watch;
+                                }
+                            } else {
+                                let watch_coverage_rebased =
+                                    self.update_watches_after_move(&old.path, &path);
+                                if (is_dir || old.is_dir) && !watch_coverage_rebased {
+                                    if let Err(error) = self.add_recursive(&path) {
+                                        let _ = tx.send(event(
+                                            Action::Overflow,
+                                            path.clone(),
+                                            true,
+                                            "inotify",
+                                            Actor::unknown(),
+                                        ));
+                                        eprintln!(
+                                            "unearth: cannot cover moved directory {}: {error}",
+                                            path.display()
+                                        );
+                                        break 'watch;
+                                    }
                                 }
                             }
                         } else if old.is_dir {
@@ -4229,6 +4317,7 @@ mod tests {
             roots: vec![RootState {
                 key: normalize_index_dir(root.path()),
                 path: root.path().into(),
+                exclusions: Arc::new(Exclusions::load().unwrap()),
             }],
             paths: HashMap::new(),
             path_to_wd: BTreeMap::new(),
