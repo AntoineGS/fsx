@@ -175,7 +175,9 @@ Arguments:
     invocation asks an existing owner for graceful shutdown before replacing it. It records a
     boot ID, process start time, and heartbeat. Queue overflow, unmounts, unsupported
     event resolution, and new mount points trigger a scoped reconciliation scan instead of
-    silently losing entries. Periodic safety scans are disabled by default; set
+    silently losing entries. UNEARTH_WATCH_BATCH_MS sets the batch window in milliseconds
+    (1–30000, default 125). While a batch is pending, searches see committed results.
+    Periodic safety scans are disabled by default; set
     UNEARTH_WATCH_RECONCILE_SECS to a positive number to enable them. This command stays in
     the foreground until interrupted. Starting a watcher for an already watched root asks the
     existing owner to stop and replaces it with the new options.

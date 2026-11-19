@@ -34,8 +34,8 @@ const ACTOR_UNKNOWN: &str = "unknown";
 const ACTOR_RECONCILE: &str = "unearth:reconcile";
 const WATCH_BATCH_MAX: usize = 4096;
 const WATCH_CHANNEL_CAPACITY: usize = 16_384;
-const WATCH_BATCH_DELAY: Duration = Duration::from_millis(125);
 const WATCH_BACKEND_WAIT: Duration = Duration::from_millis(500);
+const WATCH_CONTROL_WAIT: Duration = Duration::from_millis(500);
 const WATCH_MOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const WATCH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_STARTUP_REPLAY_BATCHES: usize = 1024;
@@ -1075,6 +1075,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     if opts.positional.is_empty() {
         return Err("--watch requires at least one directory root".to_string());
     }
+    let batch_delay = watcher_policy::batch_delay()?;
     let exclusions = Arc::new(Exclusions::load()?);
     let _ = initialize_index_db()?;
     let mut roots = Vec::new();
@@ -1141,7 +1142,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
 
     claim_watch_states(&roots)?;
     for root in &roots {
-        record_watch_config(&root.key, opts);
+        record_watch_config(&root.key, opts, batch_delay);
     }
     let _watch_state_guard = WatchStateGuard {
         roots: roots.clone(),
@@ -1309,6 +1310,13 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
     );
 
     let mut last_heartbeat = std::time::Instant::now();
+    let mut heartbeat_if_due = |conn: &mut Connection| -> Result<(), String> {
+        if last_heartbeat.elapsed() >= WATCH_HEARTBEAT_INTERVAL {
+            heartbeat_states(conn, &roots, &backend, &owner)?;
+            last_heartbeat = std::time::Instant::now();
+        }
+        Ok(())
+    };
     let reconcile_interval = periodic_reconcile_interval();
     let mut last_periodic_reconcile = std::time::Instant::now();
     if reconcile_interval.is_none() {
@@ -1319,10 +1327,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
         if WATCH_STOP.load(Ordering::Relaxed) {
             break;
         }
-        if last_heartbeat.elapsed() >= WATCH_HEARTBEAT_INTERVAL {
-            heartbeat_states(&mut event_conn, &roots, &backend, &owner)?;
-            last_heartbeat = std::time::Instant::now();
-        }
+        heartbeat_if_due(&mut event_conn)?;
         if reconcile_interval.is_some_and(|interval| last_periodic_reconcile.elapsed() >= interval)
         {
             for root in &roots {
@@ -1358,7 +1363,7 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             }
             last_periodic_reconcile = std::time::Instant::now();
         }
-        let first = match events.recv_timeout(Duration::from_millis(500)) {
+        let first = match events.recv_timeout(WATCH_CONTROL_WAIT) {
             Ok(event) => event,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -1370,16 +1375,27 @@ pub(crate) fn run(opts: &Options) -> Result<(), String> {
             }
         };
         let mut batch = vec![first];
-        let deadline = std::time::Instant::now() + WATCH_BATCH_DELAY;
+        let deadline = std::time::Instant::now() + batch_delay;
         while batch.len() < WATCH_BATCH_MAX {
+            // Control wakeups must not publish a partial batch. Shutdown and
+            // overflow do: the former flushes collected changes, and the
+            // latter marks affected roots dirty and starts recovery promptly.
+            if WATCH_STOP.load(Ordering::Relaxed)
+                || batch
+                    .last()
+                    .is_some_and(|event| event.action == Action::Overflow)
+            {
+                break;
+            }
+            heartbeat_if_due(&mut event_conn)?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match events.recv_timeout(remaining) {
+            match events.recv_timeout(remaining.min(WATCH_CONTROL_WAIT)) {
                 Ok(event) => batch.push(event),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout)
-                | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
         metric_max(
@@ -1980,6 +1996,11 @@ fn process_batch(
     tx.commit().map_err(|e| e.to_string())?;
     metric_add(metrics.map(|metrics| &metrics.db_transactions), 1);
     metric_elapsed(metrics.map(|metrics| &metrics.db_nanos), db_started);
+    // Do not begin a new scan after flushing on shutdown. Startup catches
+    // up queued events and any subtree reconciliation this stop interrupted.
+    if WATCH_STOP.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     invalidate_stale_reconcile_scans(&batch, &mut reconcile_scans);
     drop(batch);
     reconcile.retain(|path| !full_refresh.iter().any(|root| path_in_root(root, path)));
@@ -2004,6 +2025,9 @@ fn process_batch(
         };
         metric_add(metrics.map(|metrics| &metrics.subtree_scans), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.subtree_scan_nanos), started);
+        if WATCH_STOP.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if let Err(error) = result {
             if let Some(root) = matching_root(roots, &path) {
                 update_state_error(&root.key, backend, &error)?;
@@ -2030,6 +2054,9 @@ fn process_batch(
         db_caches.clear();
         metric_add(metrics.map(|metrics| &metrics.refreshes), 1);
         metric_elapsed(metrics.map(|metrics| &metrics.refresh_nanos), started);
+        if WATCH_STOP.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if let Err(error) = result {
             update_state_error(&root, backend, &error)?;
             failed_roots.push((root, error));

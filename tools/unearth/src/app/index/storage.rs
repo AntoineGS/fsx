@@ -214,12 +214,12 @@ pub(crate) fn update_watch_task(root: &str, name: &str, state: &str, error: Opti
 /// Record the effective watcher configuration at each ownership transition.
 /// A restart with changed options therefore leaves an inspectable provenance
 /// trail without adding work to the filesystem-event hot path.
-pub(crate) fn record_watch_config(root: &str, opts: &Options) {
+pub(crate) fn record_watch_config(root: &str, opts: &Options, batch_delay: Duration) {
     let Ok(conn) = open_index_db_writer() else {
         return;
     };
     let source = config_source(opts);
-    let effective = effective_config_json(opts);
+    let effective = effective_config_json(opts, batch_delay);
     let now = unix_now();
     let sequence: i64 = conn
         .query_row(
@@ -257,6 +257,7 @@ pub(crate) fn record_watch_config(root: &str, opts: &Options) {
 fn config_source(opts: &Options) -> &'static str {
     if std::env::var_os("FSX_DIAGNOSTICS").is_some()
         || std::env::var_os("UNEARTH_WATCH_RECONCILE_SECS").is_some()
+        || std::env::var_os("UNEARTH_WATCH_BATCH_MS").is_some()
     {
         if opts.threads_explicit || opts.timeout_explicit || opts.watch_metrics.is_some() {
             "cli+env+defaults"
@@ -270,7 +271,7 @@ fn config_source(opts: &Options) -> &'static str {
     }
 }
 
-fn effective_config_json(opts: &Options) -> String {
+fn effective_config_json(opts: &Options, batch_delay: Duration) -> String {
     let diagnostics = !std::env::var("FSX_DIAGNOSTICS")
         .map(|value| matches!(value.as_str(), "0" | "off" | "false"))
         .unwrap_or(false);
@@ -279,7 +280,7 @@ fn effective_config_json(opts: &Options) -> String {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     format!(
-        "{{\"threads\":{},\"timeout_seconds\":{},\"metrics_enabled\":{},\"metrics_ttl_seconds\":{},\"metrics_max_bytes\":{},\"diagnostics_enabled\":{},\"periodic_reconcile_seconds\":{}}}",
+        "{{\"threads\":{},\"timeout_seconds\":{},\"metrics_enabled\":{},\"metrics_ttl_seconds\":{},\"metrics_max_bytes\":{},\"diagnostics_enabled\":{},\"periodic_reconcile_seconds\":{},\"batch_delay_ms\":{}}}",
         opts.threads_override.max(1),
         opts.timeout_dur.as_secs(),
         opts.watch_metrics.is_some(),
@@ -287,6 +288,7 @@ fn effective_config_json(opts: &Options) -> String {
         opts.watch_metrics_max_bytes,
         diagnostics,
         reconcile,
+        batch_delay.as_millis(),
     )
 }
 

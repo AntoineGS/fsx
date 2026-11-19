@@ -148,6 +148,13 @@ targeted reconciliation. Set `UNEARTH_WATCH_RECONCILE_SECS` to a positive number
 enable an additional periodic safety scan, or set it to `0` to explicitly disable that optional
 scan. A full initial scan is still performed when the watcher starts.
 
+Set `UNEARTH_WATCH_BATCH_MS` to an integer from `1` to `30000` to change the event
+batch window (default `125`). A longer window can reduce writes but delays when
+changes become searchable. The watcher renews its heartbeat without flushing the
+batch. A full batch or an overflow can end the wait early. On SIGTERM the watcher
+commits the changes it has collected and leaves any remaining catch-up to the next
+startup. `unearth --watch-status-json` reports the effective `batch_delay_ms`.
+
 Inspect persisted state with:
 
 ```bash
