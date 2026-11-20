@@ -6,7 +6,7 @@ edition = "2021"
 
 [features]
 default = ["index", "jemalloc"]
-index = ["dep:rusqlite", "fsx/index"]
+index = ["dep:rusqlite", "fsx/index", "dep:libc"]
 jemalloc = ["dep:jemallocator"]
 watcher = ["index", "jemalloc", "dep:jemalloc-sys", "dep:libc"]
 
