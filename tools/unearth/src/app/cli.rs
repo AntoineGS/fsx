@@ -50,7 +50,8 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache] [--live|--no-index]
-                        [--index|--index-if-watched] [--index-binary] [--require-live-index]
+                       [--index|--index-if-watched] [--index-binary] [--require-live-index]
+                       [--stream-index-binary]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
@@ -139,10 +140,12 @@ Arguments:
     fall back to the live filesystem size walker.
     Full-path (-F) searches use the same fallback automatically when a clean
     watcher covers the root; --index-if-watched remains available explicitly.
-   - --index-binary writes --index results as repeated little-endian
+  - --index-binary writes --index results as repeated little-endian
      u32-length-prefixed path bytes instead of newline-delimited text; directory
      paths retain their trailing slash marker. --require-live-index restricts
      binary queries to a clean live daemon and never falls back to local data or a walk.
+     --stream-index-binary additionally flushes provisional records before daemon
+     completion; any later error means stdout must be discarded.
   - --case-sensitive disables the default case-insensitive pattern matching.
   - --lossless-paths percent-encodes invalid filename bytes as %XX in textual
     output so paths can be transported without replacement characters.
@@ -404,6 +407,7 @@ where
         index_mode: false,
         index_if_watched: false,
         index_binary: false,
+        stream_index_binary: false,
         recent_limit: None,
         index_refresh: None,
         index_snapshot: None,
@@ -646,6 +650,7 @@ where
                 opts.index_mode = true;
                 opts.index_binary = true;
             }
+            "--stream-index-binary" => opts.stream_index_binary = true,
             "--recent" => {
                 i += 1;
                 if i < args.len() {
@@ -855,6 +860,11 @@ where
     }
     if opts.require_live_index && !opts.index_binary {
         return Err("--require-live-index requires --index-binary".to_string());
+    }
+    if opts.stream_index_binary && (!opts.require_live_index || !opts.index_binary) {
+        return Err(
+            "--stream-index-binary requires --require-live-index and --index-binary".to_string(),
+        );
     }
     if opts.require_live_index
         && (opts.index_if_watched
@@ -1309,6 +1319,35 @@ mod tests {
         )
         .expect_err("strict live index requires binary indexed query");
         assert!(error.contains("--index-binary"));
+    }
+
+    #[test]
+    fn streaming_strict_binary_requires_both_strict_and_binary_modes() {
+        let options = parse_args_from(
+            [
+                "--require-live-index",
+                "--index-binary",
+                "--stream-index-binary",
+                "--hidden",
+                "*",
+                "/tmp",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("streaming strict binary options");
+        assert!(options.require_live_index);
+        assert!(options.index_binary);
+        assert!(options.stream_index_binary);
+
+        for arguments in [
+            vec!["--stream-index-binary", "--index-binary", "*", "/tmp"],
+            vec!["--stream-index-binary", "--require-live-index", "*", "/tmp"],
+        ] {
+            let error = parse_args_from(arguments.into_iter().map(str::to_string))
+                .expect_err("streaming requires both prerequisites");
+            assert!(!error.is_empty());
+        }
     }
 
     #[test]

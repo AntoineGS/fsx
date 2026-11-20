@@ -81,6 +81,7 @@ pub(crate) struct Options {
     pub(crate) index_mode: bool,
     pub(crate) index_if_watched: bool,
     pub(crate) index_binary: bool,
+    pub(crate) stream_index_binary: bool,
     pub(crate) recent_limit: Option<usize>,
     pub(crate) index_refresh: Option<String>,
     pub(crate) index_snapshot: Option<String>,

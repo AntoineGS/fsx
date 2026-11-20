@@ -237,6 +237,59 @@ fn stage_strict_binary_results_with_limits<W: Write>(
     spool.publish(output)
 }
 
+fn stream_strict_binary_results<W: Write>(
+    reader: &mut BufReader<UnixStream>,
+    output: &mut W,
+    limit: Option<usize>,
+    inactivity_timeout: Duration,
+    deadline: Instant,
+) -> Result<(), String> {
+    stream_strict_binary_results_with_limits(
+        reader,
+        output,
+        limit,
+        STRICT_QUERY_MAX_SPOOL_BYTES,
+        deadline,
+        inactivity_timeout,
+    )
+}
+
+fn stream_strict_binary_results_with_limits<W: Write>(
+    reader: &mut BufReader<UnixStream>,
+    output: &mut W,
+    limit: Option<usize>,
+    max_bytes: u64,
+    deadline: Instant,
+    inactivity_timeout: Duration,
+) -> Result<(), String> {
+    let mut emitted = 0usize;
+    let mut written_bytes = 0u64;
+    let mut flushed_first_record = false;
+    read_query_results_with_deadline(reader, deadline, inactivity_timeout, |result| {
+        if limit.is_some_and(|limit| emitted >= limit) {
+            return Ok(());
+        }
+        write_binary_path_record_bounded(
+            output,
+            &result.path,
+            result.path_encoded,
+            &mut written_bytes,
+            Some(max_bytes),
+        )
+        .map_err(|error| error.to_string())?;
+        emitted += 1;
+        if !flushed_first_record {
+            output.flush().map_err(|error| error.to_string())?;
+            flushed_first_record = true;
+        }
+        Ok(())
+    })?;
+    if Instant::now() >= deadline {
+        return Err("strict query timed out".to_string());
+    }
+    output.flush().map_err(|error| error.to_string())
+}
+
 fn strict_binary_output_terminal_error(stdout_is_tty: bool) -> Option<&'static str> {
     stdout_is_tty.then_some("refusing to write strict binary index results to a terminal")
 }
@@ -1091,13 +1144,24 @@ pub(crate) fn run_indexed_via_daemon(
     if opts.require_live_index {
         let stdout = io::stdout();
         let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
-        stage_strict_binary_results(
-            &mut reader,
-            &mut output,
-            opts.limit,
-            opts.timeout_dur,
-            strict_deadline.expect("strict request has a deadline"),
-        )?;
+        let deadline = strict_deadline.expect("strict request has a deadline");
+        if opts.stream_index_binary {
+            stream_strict_binary_results(
+                &mut reader,
+                &mut output,
+                opts.limit,
+                opts.timeout_dur,
+                deadline,
+            )?;
+        } else {
+            stage_strict_binary_results(
+                &mut reader,
+                &mut output,
+                opts.limit,
+                opts.timeout_dur,
+                deadline,
+            )?;
+        }
         return Ok(Some(SearchRun {
             lines: Vec::new(),
             timed_out: false,
@@ -1598,6 +1662,176 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn strict_stream_flushes_records_before_the_daemon_terminator() {
+        use std::sync::mpsc;
+
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let (flushed_tx, flushed_rx) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            write_test_query_result(&mut server, b"/first");
+            let visible = flushed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first record flushed before terminator");
+            let mut expected = Vec::new();
+            write_binary_path_record(&mut expected, "/first", true).expect("expected record");
+            assert_eq!(visible, expected);
+            server.write_all(&0u32.to_le_bytes()).expect("terminator");
+        });
+        let mut reader = BufReader::new(client);
+        let mut output = FlushSignalWriter {
+            bytes: Vec::new(),
+            flushed: Some(flushed_tx),
+        };
+        stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("stream complete query");
+        sender.join().expect("daemon thread");
+        assert_eq!(output.bytes.len(), 4 + b"/first".len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_reports_truncation_after_provisional_output() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, b"/provisional");
+        drop(server);
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+
+        let result = stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+
+        assert!(result.is_err());
+        assert!(!output.is_empty(), "streaming output is provisional");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_enforces_byte_budget_including_equality_and_zero() {
+        for (budget, should_succeed) in [(4 + b"/exact".len() as u64, true), (0, false)] {
+            let (mut server, client) = UnixStream::pair().expect("socket pair");
+            write_test_query_result(&mut server, b"/exact");
+            server.write_all(&0u32.to_le_bytes()).expect("terminator");
+            drop(server);
+            let mut reader = BufReader::new(client);
+            let mut output = Vec::new();
+            let result = stream_strict_binary_results_with_limits(
+                &mut reader,
+                &mut output,
+                None,
+                budget,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            );
+            assert_eq!(result.is_ok(), should_succeed);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_applies_limit_and_consumes_daemon_terminator() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, b"/first");
+        write_test_query_result(&mut server, b"/second");
+        server.write_all(&0u32.to_le_bytes()).expect("terminator");
+        drop(server);
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+
+        stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            Some(1),
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("stream limited query");
+
+        let mut expected = Vec::new();
+        write_binary_path_record(&mut expected, "/first", true).expect("expected record");
+        assert_eq!(output, expected);
+        let mut trailing = [0; 1];
+        assert_eq!(reader.read(&mut trailing).expect("terminator consumed"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_preserves_raw_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = PathBuf::from(OsString::from_vec(b"/tmp/stream-\xff".to_vec()));
+        let encoded = fsx::encode_lossless_path(&raw);
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, encoded.as_bytes());
+        server.write_all(&0u32.to_le_bytes()).expect("terminator");
+        drop(server);
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+
+        stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(100),
+        )
+        .expect("stream raw path");
+
+        let mut expected = Vec::new();
+        write_binary_path_record(&mut expected, &encoded, true).expect("expected raw record");
+        assert_eq!(output, expected);
+        assert_eq!(&output[4..], raw.as_os_str().as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_obeys_injected_overall_deadline() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let sender = std::thread::spawn(move || {
+            write_test_query_result(&mut server, b"/visible");
+            for byte in 0u32.to_le_bytes() {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut reader = BufReader::new(client);
+        let mut output = Vec::new();
+        let started = Instant::now();
+
+        let result = stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            started + Duration::from_millis(25),
+            Duration::from_secs(1),
+        );
+
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(!output.is_empty(), "streamed data remains provisional");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        sender.join().expect("sender thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn strict_staging_enforces_an_overall_deadline() {
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         let sender = std::thread::spawn(move || {
@@ -1694,6 +1928,29 @@ mod tests {
         )
         .is_err());
         assert!(output.is_empty(), "partial candidates escaped staging");
+    }
+
+    #[cfg(unix)]
+    struct FlushSignalWriter {
+        bytes: Vec<u8>,
+        flushed: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    }
+
+    #[cfg(unix)]
+    impl Write for FlushSignalWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(flushed) = self.flushed.take() {
+                flushed
+                    .send(self.bytes.clone())
+                    .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+            }
+            Ok(())
+        }
     }
 
     #[cfg(unix)]

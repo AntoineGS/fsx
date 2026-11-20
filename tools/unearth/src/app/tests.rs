@@ -38,6 +38,7 @@ fn base_opts() -> Options {
         index_mode: false,
         index_if_watched: false,
         index_binary: false,
+        stream_index_binary: false,
         recent_limit: None,
         index_refresh: None,
         index_snapshot: None,

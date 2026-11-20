@@ -49,6 +49,10 @@ searchable and usable by the watcher. `--index-binary` decodes those keys and wr
 length-prefixed record containing the original path bytes rather than the escaped database text.
 Add `--require-live-index` to make a binary indexed query daemon-only: it fails with no output if
 there is no clean compatible live watcher, and never falls back to a local database query or scan.
+Add `--stream-index-binary` with both flags to flush records as they arrive. Those bytes are
+provisional until the daemon's successful terminator is received and stdout is flushed; on any
+query error, callers must discard the output. Without this option, strict binary results remain
+atomically buffered and are published only after the complete response succeeds.
 
 `fsxd` and standalone `--index-refresh` read `$XDG_CONFIG_HOME/fsx/excludes.tsv` (or
 `~/.config/fsx/excludes.tsv`). Each non-comment line is `path<TAB>/absolute/path`,
@@ -258,8 +262,8 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N]
                        [--cache-raw] [--snapshot-cache] [--live|--no-index]
-                        [--index|--index-if-watched] [--index-binary]
-                        [--require-live-index]
+                       [--index|--index-if-watched] [--index-binary]
+                       [--require-live-index] [--stream-index-binary]
                        [--recent N]
                        [--index-refresh DIR] [--index-snapshot DIR]
                        [--index-purge DIR]
