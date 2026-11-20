@@ -52,7 +52,11 @@ there is no clean compatible live watcher, and never falls back to a local datab
 Add `--stream-index-binary` with both flags to flush records as they arrive. Those bytes are
 provisional until the daemon's successful terminator is received and stdout is flushed; on any
 query error, callers must discard the output. Without this option, strict binary results remain
-atomically buffered and are published only after the complete response succeeds.
+atomically buffered and are published only after the complete response succeeds. When stdout is a
+FIFO, streaming uses an independent nonblocking descriptor so pipe backpressure is bounded by the
+query deadline without changing the inherited stdout flags. Regular-file and unsupported stdout
+types retain ordinary writes; an OS-blocked regular-file write cannot be interrupted by this
+deadline.
 
 `fsxd` and standalone `--index-refresh` read `$XDG_CONFIG_HOME/fsx/excludes.tsv` (or
 `~/.config/fsx/excludes.tsv`). Each non-comment line is `path<TAB>/absolute/path`,

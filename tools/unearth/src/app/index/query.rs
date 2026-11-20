@@ -9,38 +9,88 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::time::Instant;
+#[cfg(target_os = "linux")]
+use std::{ffi::CString, fs::File, os::fd::FromRawFd};
 
 const QUERY_CONSUMER_STOP: &str = "unearth query consumer stopped after limit";
 const STRICT_QUERY_MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
 const STRICT_QUERY_OVERALL_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Writes directly to a nonblocking file descriptor so strict streaming output
-/// cannot block past the daemon query's overall deadline.
-struct DeadlineFdWriter {
-    fd: libc::c_int,
-    original_flags: libc::c_int,
+/// A separate open-file description for FIFO stdout, so O_NONBLOCK never
+/// changes status flags on the inherited stdout description.
+#[cfg(target_os = "linux")]
+struct DeadlinePipeWriter {
+    file: File,
     deadline: Instant,
 }
 
-impl DeadlineFdWriter {
-    fn new(fd: libc::c_int, deadline: Instant) -> io::Result<Self> {
-        // SAFETY: `fd` is borrowed from the caller and remains open while this
-        // writer is used. F_GETFL does not mutate descriptor state.
-        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if original_flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: F_SETFL updates only status flags on the borrowed descriptor.
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            fd,
-            original_flags,
-            deadline,
-        })
+#[cfg(target_os = "linux")]
+fn deadline_pipe_writer_for_fd(
+    fd: libc::c_int,
+    deadline: Instant,
+) -> io::Result<Option<DeadlinePipeWriter>> {
+    let mut stdout_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stdout_stat` points to writable storage for `libc::stat`.
+    if unsafe { libc::fstat(fd, stdout_stat.as_mut_ptr()) } != 0 {
+        return Ok(None);
+    }
+    // SAFETY: fstat initialized the struct after reporting success.
+    let stdout_stat = unsafe { stdout_stat.assume_init() };
+    if stdout_stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Ok(None);
     }
 
+    let path = CString::new(format!("/proc/self/fd/{fd}"))
+        .expect("numeric file descriptor contains no NUL byte");
+    // Opening procfs' descriptor link creates an independent file description.
+    // Do not fall back to toggling flags on `fd`: it may be shared with a shell
+    // or another process and would remain changed if this process is signalled.
+    // SAFETY: `path` is NUL-terminated and remains alive for this call.
+    let opened = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot open independent nonblocking stdout pipe through procfs: {error}"),
+        ));
+    }
+    // SAFETY: `opened` is a fresh descriptor returned by open and is now owned.
+    let file = unsafe { File::from_raw_fd(opened) };
+    let opened_flags = unsafe { libc::fcntl(opened, libc::F_GETFL) };
+    if opened_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if opened_flags & libc::O_NONBLOCK == 0 {
+        return Err(io::Error::other(
+            "procfs stdout pipe descriptor is not nonblocking",
+        ));
+    }
+
+    let mut opened_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `opened_stat` points to writable storage and `file` owns `opened`.
+    if unsafe { libc::fstat(opened, opened_stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the struct after reporting success.
+    let opened_stat = unsafe { opened_stat.assume_init() };
+    if opened_stat.st_mode & libc::S_IFMT != libc::S_IFIFO
+        || opened_stat.st_dev != stdout_stat.st_dev
+        || opened_stat.st_ino != stdout_stat.st_ino
+    {
+        return Err(io::Error::other(
+            "procfs stdout descriptor did not reopen the same FIFO",
+        ));
+    }
+    Ok(Some(DeadlinePipeWriter { file, deadline }))
+}
+
+#[cfg(target_os = "linux")]
+impl DeadlinePipeWriter {
     fn check_deadline(&self) -> io::Result<()> {
         if Instant::now() >= self.deadline {
             Err(io::Error::new(
@@ -61,12 +111,12 @@ impl DeadlineFdWriter {
                 .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
                 .min(libc::c_int::MAX as u128) as libc::c_int;
             let mut descriptor = libc::pollfd {
-                fd: self.fd,
+                fd: self.file.as_raw_fd(),
                 events: libc::POLLOUT,
                 revents: 0,
             };
-            // SAFETY: `descriptor` is a valid, initialized pollfd for the
-            // duration of this call; poll reads/writes only that value.
+            // SAFETY: `descriptor` is valid initialized pollfd storage for this
+            // call. The underlying fd is owned by `self.file`.
             let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
             if ready > 0 {
                 return Ok(());
@@ -85,14 +135,15 @@ impl DeadlineFdWriter {
     }
 }
 
-impl Write for DeadlineFdWriter {
+#[cfg(target_os = "linux")]
+impl Write for DeadlinePipeWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         loop {
             self.check_deadline()?;
-            // SAFETY: `buffer` is valid for `buffer.len()` bytes and `fd`
-            // remains borrowed/open for this writer's lifetime. O_NONBLOCK
-            // ensures this write cannot wait for output capacity.
-            let written = unsafe { libc::write(self.fd, buffer.as_ptr().cast(), buffer.len()) };
+            // SAFETY: `buffer` is valid for `buffer.len()` bytes. The owned fd
+            // has O_NONBLOCK set by open, so this call cannot wait for capacity.
+            let written =
+                unsafe { libc::write(self.file.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
             if written >= 0 {
                 return Ok(written as usize);
             }
@@ -113,11 +164,40 @@ impl Write for DeadlineFdWriter {
     }
 }
 
-impl Drop for DeadlineFdWriter {
-    fn drop(&mut self) {
-        // SAFETY: this writer borrowed `fd` and saved its original flags in
-        // `new`; restoring them here covers success and every error path.
-        let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.original_flags) };
+enum StrictStreamStdoutWriter<'a> {
+    #[cfg(target_os = "linux")]
+    Pipe(DeadlinePipeWriter),
+    Ordinary(io::StdoutLock<'a>),
+}
+
+impl<'a> StrictStreamStdoutWriter<'a> {
+    fn new(stdout: io::StdoutLock<'a>, deadline: Instant) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(writer) = deadline_pipe_writer_for_fd(stdout.as_raw_fd(), deadline)? {
+            return Ok(Self::Pipe(writer));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = deadline;
+
+        Ok(Self::Ordinary(stdout))
+    }
+}
+
+impl Write for StrictStreamStdoutWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Pipe(writer) => writer.write(buffer),
+            Self::Ordinary(writer) => writer.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Pipe(writer) => writer.flush(),
+            Self::Ordinary(writer) => writer.flush(),
+        }
     }
 }
 
@@ -385,6 +465,9 @@ fn stream_strict_binary_results_with_limits<W: Write>(
             Some(max_bytes),
         )
         .map_err(|error| error.to_string())?;
+        if Instant::now() >= deadline {
+            return Err("strict query timed out".to_string());
+        }
         emitted += 1;
         if !flushed_first_record {
             output.flush().map_err(|error| error.to_string())?;
@@ -1260,16 +1343,20 @@ pub(crate) fn run_indexed_via_daemon(
         let deadline = strict_deadline.expect("strict request has a deadline");
         if opts.stream_index_binary {
             let stdout = io::stdout();
-            let stdout_lock = stdout.lock();
-            let mut output = DeadlineFdWriter::new(stdout_lock.as_raw_fd(), deadline)
-                .map_err(|error| error.to_string())?;
-            stream_strict_binary_results(
+            let writer = StrictStreamStdoutWriter::new(stdout.lock(), deadline)
+                .map_err(|error| format!("cannot prepare strict stream stdout: {error}"))?;
+            let mut output = BufWriter::with_capacity(64 * 1024, writer);
+            let result = stream_strict_binary_results(
                 &mut reader,
                 &mut output,
                 opts.limit,
                 opts.timeout_dur,
                 deadline,
-            )?;
+            );
+            // Never let BufWriter::drop retry blocked provisional output after
+            // an error or cancellation. On success the buffer is empty.
+            let _discarded_parts = output.into_parts();
+            result?;
         } else {
             let stdout = io::stdout();
             let mut output = BufWriter::with_capacity(64 * 1024, stdout.lock());
@@ -1951,8 +2038,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn strict_stream_stdout_pipe_write_respects_deadline_and_restores_flags() {
+    fn strict_stream_pipe_uses_independent_flags_and_respects_deadline() {
         use std::os::fd::{AsRawFd, FromRawFd};
+        use std::sync::mpsc;
 
         let mut pipe_fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -1981,11 +2069,19 @@ mod tests {
         let (mut server, client) = UnixStream::pair().expect("socket pair");
         write_test_query_result(&mut server, b"/blocked");
         server.write_all(&0u32.to_le_bytes()).expect("terminator");
-        let mut reader = BufReader::new(client);
-        let deadline = Instant::now() + Duration::from_millis(30);
+        let deadline = Instant::now() + Duration::from_millis(80);
         let started = Instant::now();
-        let result = {
-            let mut output = DeadlineFdWriter::new(fd, deadline).expect("deadline writer");
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let writer = deadline_pipe_writer_for_fd(fd, deadline)
+                .expect("open independent pipe writer")
+                .expect("stdout is a pipe");
+            let opened_flags = unsafe { libc::fcntl(writer.file.as_raw_fd(), libc::F_GETFL) };
+            opened_tx
+                .send(opened_flags)
+                .expect("report independent writer open");
+            let mut output = BufWriter::with_capacity(64 * 1024, writer);
+            let mut reader = BufReader::new(client);
             let result = stream_strict_binary_results_with_limits(
                 &mut reader,
                 &mut output,
@@ -1994,14 +2090,44 @@ mod tests {
                 deadline,
                 Duration::from_millis(100),
             );
-            drop(output);
+            let _discarded_parts = output.into_parts();
             result
-        };
+        });
 
-        assert!(result.unwrap_err().contains("timed out"));
+        let opened_flags = opened_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("independent writer opened");
+        assert!(opened_flags >= 0);
+        assert_ne!(opened_flags & libc::O_NONBLOCK, 0);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original_flags);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) },
+            original_flags,
+            "shared stdout flags must stay unchanged during backpressure"
+        );
+        assert!(worker
+            .join()
+            .expect("writer thread")
+            .unwrap_err()
+            .contains("timed out"));
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original_flags);
         drop(reader_pipe); // Keep the read end alive until after the timed write.
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_stream_pipe_detection_leaves_regular_file_stdout_ordinary() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::tempfile().expect("temporary output file");
+        assert!(deadline_pipe_writer_for_fd(
+            file.as_raw_fd(),
+            Instant::now() + Duration::from_secs(1)
+        )
+        .expect("classify regular file")
+        .is_none());
     }
 
     #[cfg(unix)]
@@ -2028,6 +2154,35 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_stream_rejects_a_deadline_exceeded_during_write() {
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        write_test_query_result(&mut server, b"/slow-write");
+        server.write_all(&0u32.to_le_bytes()).expect("terminator");
+        let mut reader = BufReader::new(client);
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let mut output = DelayedWriteWriter {
+            delay: Duration::from_millis(30),
+            bytes: Vec::new(),
+        };
+
+        let result = stream_strict_binary_results_with_limits(
+            &mut reader,
+            &mut output,
+            None,
+            1024,
+            deadline,
+            Duration::from_millis(100),
+        );
+
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(
+            !output.bytes.is_empty(),
+            "written record remains provisional"
+        );
     }
 
     #[cfg(unix)]
@@ -2157,6 +2312,25 @@ mod tests {
     struct DelayedFlushWriter {
         delay: Duration,
         bytes: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    struct DelayedWriteWriter {
+        delay: Duration,
+        bytes: Vec<u8>,
+    }
+
+    #[cfg(unix)]
+    impl Write for DelayedWriteWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[cfg(unix)]
