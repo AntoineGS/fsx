@@ -1334,11 +1334,16 @@ mod tests {
             ]
             .into_iter()
             .map(str::to_string),
-        )
-        .expect("streaming strict binary options");
-        assert!(options.require_live_index);
-        assert!(options.index_binary);
-        assert!(options.stream_index_binary);
+        );
+        if cfg!(feature = "index") {
+            let options = options.expect("streaming strict binary options");
+            assert!(options.require_live_index);
+            assert!(options.index_binary);
+            assert!(options.stream_index_binary);
+        } else {
+            let error = options.expect_err("streaming requires the index feature");
+            assert!(error.contains("without the index feature"));
+        }
 
         for arguments in [
             vec!["--stream-index-binary", "--index-binary", "*", "/tmp"],
