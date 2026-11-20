@@ -107,8 +107,8 @@ impl DeadlinePipeWriter {
             self.check_deadline()?;
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             let timeout_ms = remaining
-                .as_millis()
-                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                .as_nanos()
+                .div_ceil(1_000_000)
                 .min(libc::c_int::MAX as u128) as libc::c_int;
             let mut descriptor = libc::pollfd {
                 fd: self.file.as_raw_fd(),
