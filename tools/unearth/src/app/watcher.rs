@@ -4550,35 +4550,25 @@ mod tests {
             fs::write(root.path().join(format!("file-{index}")), b"x").expect("create file");
         }
 
-        // Wait until the backend has read everything the kernel queued.
-        let queued = || observer.backlog.lock().unwrap().events.len() + rx.inner.len();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut last = queued();
-        loop {
-            thread::sleep(Duration::from_millis(300));
-            let now = queued();
-            if now == last || Instant::now() > deadline {
-                break;
-            }
-            last = now;
-        }
-
+        // Nothing consumed the channel while the files were created. Collect
+        // until every file has arrived rather than inferring completion from
+        // a quiet queue, which a busy machine can fake.
         let mut created = HashSet::new();
-        loop {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while created.len() < FILES && Instant::now() < deadline {
             observer.flush().unwrap();
-            let mut received = false;
-            while let Ok(event) = rx.try_recv() {
-                received = true;
-                assert_ne!(
-                    event.action,
-                    Action::Overflow,
-                    "the stalled consumer caused a recovery for {}",
-                    event.path.display()
-                );
-                created.insert(event.path);
-            }
-            if !received {
-                break;
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    assert_ne!(
+                        event.action,
+                        Action::Overflow,
+                        "the stalled consumer caused a recovery for {}",
+                        event.path.display()
+                    );
+                    created.insert(event.path);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("event channel closed: {error}"),
             }
         }
         assert_eq!(created.len(), FILES);
