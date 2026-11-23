@@ -724,14 +724,7 @@ impl EventSender {
 
     fn flush_locked(&self, backlog: &mut EventBacklog) -> Result<(), ()> {
         if backlog.recovery_pending {
-            let recovery = event(
-                Action::Overflow,
-                PathBuf::from("/"),
-                true,
-                "backlog",
-                Actor::unknown(),
-            );
-            match self.inner.try_send(recovery) {
+            match self.inner.try_send(backlog_recovery()) {
                 Ok(()) => backlog.recovery_pending = false,
                 Err(TrySendError::Full(_)) => return Ok(()),
                 Err(TrySendError::Disconnected(_)) => return Err(()),
@@ -761,6 +754,40 @@ impl EventSender {
                 .remove(&event.path);
         }
     }
+}
+
+impl Drop for EventSender {
+    /// Backends exit on fatal errors right after queueing their recovery. The
+    /// last sender owns the backlog, so it delivers it before the channel
+    /// disconnects, waiting for the consumer like the blocking send this
+    /// backlog replaced. Backends hold a single sender, so the count is exact.
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.backlog) != 1 {
+            return;
+        }
+        let mut backlog = self.backlog.lock().unwrap_or_else(|e| e.into_inner());
+        if backlog.recovery_pending {
+            if self.inner.send(backlog_recovery()).is_err() {
+                return;
+            }
+            backlog.recovery_pending = false;
+        }
+        while let Some(event) = backlog.events.pop_front() {
+            if self.inner.send(event).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn backlog_recovery() -> FsEvent {
+    event(
+        Action::Overflow,
+        PathBuf::from("/"),
+        true,
+        "backlog",
+        Actor::unknown(),
+    )
 }
 
 fn is_coalescible(event: &FsEvent) -> bool {
@@ -4851,6 +4878,36 @@ mod tests {
         tx.send(modify.clone()).unwrap();
         tx.send(modify).unwrap();
         assert_eq!(drain_paths(&tx, &rx), vec![created(0).path, path]);
+    }
+
+    #[test]
+    fn event_queue_delivers_the_backlog_when_the_last_sender_exits() {
+        let (tx, rx) = event_queue_with_backlog(1, 16);
+        tx.send(created(0)).unwrap();
+        tx.send(created(1)).unwrap();
+        tx.send(event(
+            Action::Overflow,
+            PathBuf::from("/"),
+            true,
+            "test",
+            Actor::unknown(),
+        ))
+        .unwrap();
+        // A backend that hits a fatal error queues its recovery and exits.
+        let backend = thread::spawn(move || drop(tx));
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx.inner.recv_timeout(Duration::from_secs(5)) {
+            delivered.push((event.action, event.path));
+        }
+        backend.join().unwrap();
+        assert_eq!(
+            delivered,
+            vec![
+                (Action::Upsert, created(0).path),
+                (Action::Upsert, created(1).path),
+                (Action::Overflow, PathBuf::from("/")),
+            ]
+        );
     }
 
     #[test]
