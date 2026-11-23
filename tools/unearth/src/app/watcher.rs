@@ -4598,7 +4598,7 @@ mod tests {
             roots: vec![RootState {
                 key: normalize_index_dir(root.path()),
                 path: root.path().into(),
-                exclusions: Arc::new(Exclusions::load().unwrap()),
+                exclusions: Arc::new(Exclusions::from_lines("").unwrap()),
             }],
             paths: HashMap::new(),
             path_to_wd: BTreeMap::new(),
