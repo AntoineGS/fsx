@@ -156,6 +156,11 @@ targeted reconciliation. Set `UNEARTH_WATCH_RECONCILE_SECS` to a positive number
 enable an additional periodic safety scan, or set it to `0` to explicitly disable that optional
 scan. A full initial scan is still performed when the watcher starts.
 
+The fanotify and inotify backends keep reading kernel events while the index is busy, for example
+during a long reconciliation, so a slow consumer does not overflow the kernel queue. Events that do
+not fit the in-memory queue wait in an ordered backlog of up to 131072 events; beyond that, they
+are replaced by one full reconciliation, which observes every change they described.
+
 Set `UNEARTH_WATCH_BATCH_MS` to an integer from `1` to `30000` to change the event
 batch window (default `125`). A longer window can reduce writes but delays when
 changes become searchable. The watcher renews its heartbeat without flushing the

@@ -1,5 +1,5 @@
 use super::*;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr};
@@ -34,6 +34,8 @@ const ACTOR_UNKNOWN: &str = "unknown";
 const ACTOR_RECONCILE: &str = "unearth:reconcile";
 const WATCH_BATCH_MAX: usize = 4096;
 const WATCH_CHANNEL_CAPACITY: usize = 16_384;
+// Events held while the channel is full, beyond which a full recovery replaces them.
+const WATCH_BACKLOG_CAPACITY: usize = 131_072;
 const WATCH_BACKEND_WAIT: Duration = Duration::from_millis(500);
 const WATCH_CONTROL_WAIT: Duration = Duration::from_millis(500);
 const WATCH_MOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
@@ -601,6 +603,19 @@ struct EventSender {
     inner: Sender<FsEvent>,
     pending_modifies: Arc<Mutex<HashSet<PathBuf>>>,
     snapshot_budget: Arc<SnapshotBudget>,
+    backlog: Arc<Mutex<EventBacklog>>,
+}
+
+/// Events that did not fit the bounded channel. Backends must keep reading
+/// their kernel queue while the consumer is busy (for example during a long
+/// reconciliation): a blocked backend lets the kernel queue overflow, which
+/// forces a full rewatch and reconciliation. Backlogged events are delivered
+/// in order before any later event; past `limit` they collapse into one full
+/// recovery, because that reconciliation observes every dropped change.
+struct EventBacklog {
+    events: VecDeque<FsEvent>,
+    limit: usize,
+    recovery_pending: bool,
 }
 
 struct EventReceiver {
@@ -609,6 +624,10 @@ struct EventReceiver {
 }
 
 fn event_queue(capacity: usize) -> (EventSender, EventReceiver) {
+    event_queue_with_backlog(capacity, WATCH_BACKLOG_CAPACITY)
+}
+
+fn event_queue_with_backlog(capacity: usize, backlog_limit: usize) -> (EventSender, EventReceiver) {
     let (sender, receiver) = bounded(capacity);
     let pending_modifies = Arc::new(Mutex::new(HashSet::new()));
     (
@@ -616,6 +635,11 @@ fn event_queue(capacity: usize) -> (EventSender, EventReceiver) {
             inner: sender,
             pending_modifies: Arc::clone(&pending_modifies),
             snapshot_budget: SnapshotBudget::new(WATCH_QUEUED_SNAPSHOT_BYTES),
+            backlog: Arc::new(Mutex::new(EventBacklog {
+                events: VecDeque::new(),
+                limit: backlog_limit,
+                recovery_pending: false,
+            })),
         },
         EventReceiver {
             inner: receiver,
@@ -640,7 +664,13 @@ impl EventSender {
                 event.scanned_entries = None;
             }
         }
-        let coalescible = event.action == Action::Upsert && event.event_kind == EVENT_MODIFY;
+        let mut backlog = self.backlog.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_locked(&mut backlog)?;
+        if backlog.recovery_pending {
+            // The pending full recovery starts after this change happened.
+            return Ok(());
+        }
+        let coalescible = is_coalescible(&event);
         if coalescible {
             let mut pending = self
                 .pending_modifies
@@ -658,21 +688,83 @@ impl EventSender {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
-        let path = coalescible.then(|| event.path.clone());
-        match self.inner.send(event) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if let Some(path) = path {
-                    self.pending_modifies
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&path);
+        if backlog.events.is_empty() {
+            match self.inner.try_send(event) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(event)) => backlog.events.push_back(event),
+                Err(TrySendError::Disconnected(event)) => {
+                    self.forget_pending(&event);
+                    return Err(());
                 }
-                let _ = error;
-                Err(())
+            }
+        } else {
+            backlog.events.push_back(event);
+        }
+        if backlog.events.len() > backlog.limit {
+            for dropped in std::mem::take(&mut backlog.events) {
+                self.forget_pending(&dropped);
+            }
+            backlog.recovery_pending = true;
+            eprintln!(
+                "unearth: watch event backlog exceeded {} events; full reconciliation required",
+                backlog.limit
+            );
+            self.flush_locked(&mut backlog)?;
+        }
+        Ok(())
+    }
+
+    /// Moves backlogged events into the channel while it has room. Backends
+    /// call this on every loop iteration so a backlog drains without new
+    /// filesystem activity.
+    fn flush(&self) -> Result<(), ()> {
+        let mut backlog = self.backlog.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_locked(&mut backlog)
+    }
+
+    fn flush_locked(&self, backlog: &mut EventBacklog) -> Result<(), ()> {
+        if backlog.recovery_pending {
+            let recovery = event(
+                Action::Overflow,
+                PathBuf::from("/"),
+                true,
+                "backlog",
+                Actor::unknown(),
+            );
+            match self.inner.try_send(recovery) {
+                Ok(()) => backlog.recovery_pending = false,
+                Err(TrySendError::Full(_)) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => return Err(()),
             }
         }
+        while let Some(event) = backlog.events.pop_front() {
+            match self.inner.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    backlog.events.push_front(event);
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(event)) => {
+                    self.forget_pending(&event);
+                    return Err(());
+                }
+            }
+        }
+        Ok(())
     }
+
+    fn forget_pending(&self, event: &FsEvent) {
+        if is_coalescible(event) {
+            self.pending_modifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&event.path);
+        }
+    }
+}
+
+fn is_coalescible(event: &FsEvent) -> bool {
+    event.action == Action::Upsert && event.event_kind == EVENT_MODIFY
 }
 
 impl EventReceiver {
@@ -681,7 +773,7 @@ impl EventReceiver {
     }
 
     fn mark_dequeued(&self, event: &FsEvent) {
-        if event.action == Action::Upsert && event.event_kind == EVENT_MODIFY {
+        if is_coalescible(event) {
             self.pending_modifies
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3195,6 +3287,9 @@ impl InotifyWatcher {
     fn run(mut self, tx: EventSender) {
         let mut buffer = vec![0u8; 1024 * 1024];
         'watch: loop {
+            if tx.flush().is_err() {
+                break;
+            }
             self.expire_pending_moves(&tx);
             if let Err(error) = self.poll_mounts(&tx) {
                 let _ = tx.send(event(
@@ -4047,6 +4142,9 @@ impl FanotifyWatcher {
         let mut buffer = vec![0u8; 1024 * 1024];
         let mut last_mount_check = std::time::Instant::now();
         'watch: loop {
+            if tx.flush().is_err() {
+                break;
+            }
             if last_mount_check.elapsed() >= WATCH_MOUNT_CHECK_INTERVAL {
                 if let Err(error) = self.add_new_mounts(&tx) {
                     let _ = tx.send(event(
@@ -4393,6 +4491,74 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inotify_backend_keeps_draining_the_kernel_queue_while_the_consumer_stalls() {
+        // More events than the default kernel queue (16384) and the channel
+        // hold together, produced while nothing consumes the channel.
+        const FILES: usize = 12_000;
+        let root = tempfile::tempdir().expect("temporary root");
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut watcher = InotifyWatcher {
+            fd,
+            roots: vec![RootState {
+                key: normalize_index_dir(root.path()),
+                path: root.path().to_path_buf(),
+                exclusions: Arc::new(Exclusions::from_lines("").expect("no exclusions")),
+            }],
+            paths: HashMap::new(),
+            path_to_wd: BTreeMap::new(),
+            pending_moves: HashMap::new(),
+            pending_self_moves: HashMap::new(),
+            recently_rebased: HashMap::new(),
+            mounted: HashSet::new(),
+            last_mount_check: Instant::now(),
+        };
+        watcher.add_recursive(root.path()).expect("watch root");
+        let (tx, rx) = event_queue_with_backlog(16, WATCH_BACKLOG_CAPACITY);
+        let observer = tx.clone();
+        let backend = thread::spawn(move || watcher.run(tx));
+        for index in 0..FILES {
+            fs::write(root.path().join(format!("file-{index}")), b"x").expect("create file");
+        }
+
+        // Wait until the backend has read everything the kernel queued.
+        let queued = || observer.backlog.lock().unwrap().events.len() + rx.inner.len();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut last = queued();
+        loop {
+            thread::sleep(Duration::from_millis(300));
+            let now = queued();
+            if now == last || Instant::now() > deadline {
+                break;
+            }
+            last = now;
+        }
+
+        let mut created = HashSet::new();
+        loop {
+            observer.flush().unwrap();
+            let mut received = false;
+            while let Ok(event) = rx.try_recv() {
+                received = true;
+                assert_ne!(
+                    event.action,
+                    Action::Overflow,
+                    "the stalled consumer caused a recovery for {}",
+                    event.path.display()
+                );
+                created.insert(event.path);
+            }
+            if !received {
+                break;
+            }
+        }
+        assert_eq!(created.len(), FILES);
+        // Like production, the backend runs until the process exits.
+        assert!(!backend.is_finished(), "the backend stopped reading");
+    }
+
     #[test]
     fn configured_move_marks_watcher_roots_dirty_in_the_move_transaction() {
         let mut conn = Connection::open_in_memory().expect("in-memory db");
@@ -4605,6 +4771,96 @@ mod tests {
         assert_eq!(dequeued.path, path);
         tx.send(first).unwrap();
         assert_eq!(rx.inner.len(), 1);
+    }
+
+    fn created(index: usize) -> FsEvent {
+        event(
+            Action::Upsert,
+            PathBuf::from(format!("/tmp/unearth-backlog/{index}")),
+            false,
+            "test",
+            Actor::unknown(),
+        )
+    }
+
+    fn drain_paths(tx: &EventSender, rx: &EventReceiver) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        loop {
+            tx.flush().unwrap();
+            let before = paths.len();
+            while let Ok(event) = rx.try_recv() {
+                paths.push(event.path);
+            }
+            if paths.len() == before {
+                return paths;
+            }
+        }
+    }
+
+    #[test]
+    fn event_queue_backlogs_events_instead_of_blocking_the_backend() {
+        let (tx, rx) = event_queue_with_backlog(2, 16);
+        let sender = tx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for index in 0..5 {
+                sender.send(created(index)).unwrap();
+            }
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a full event queue blocked the backend thread");
+        let expected: Vec<PathBuf> = (0..5).map(|index| created(index).path).collect();
+        assert_eq!(drain_paths(&tx, &rx), expected);
+    }
+
+    #[test]
+    fn event_queue_collapses_an_overlong_backlog_into_one_full_recovery() {
+        let (tx, rx) = event_queue_with_backlog(1, 2);
+        for index in 0..5 {
+            tx.send(created(index)).unwrap();
+        }
+        assert_eq!(rx.try_recv().unwrap().path, created(0).path);
+        tx.flush().unwrap();
+        let recovery = rx.try_recv().unwrap();
+        assert_eq!(recovery.action, Action::Overflow);
+        assert_eq!(recovery.path, PathBuf::from("/"));
+        assert!(
+            drain_paths(&tx, &rx).is_empty(),
+            "events covered by the recovery must be dropped"
+        );
+
+        tx.send(created(5)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().path, created(5).path);
+    }
+
+    #[test]
+    fn event_queue_coalesces_backlogged_modify_events() {
+        let path = PathBuf::from("/tmp/unearth-backlog-modify");
+        let (tx, rx) = event_queue_with_backlog(1, 16);
+        tx.send(created(0)).unwrap();
+        let mut modify = event(
+            Action::Upsert,
+            path.clone(),
+            false,
+            "test",
+            Actor::unknown(),
+        );
+        modify.event_kind = EVENT_MODIFY;
+        tx.send(modify.clone()).unwrap();
+        tx.send(modify).unwrap();
+        assert_eq!(drain_paths(&tx, &rx), vec![created(0).path, path]);
+    }
+
+    #[test]
+    fn event_queue_reports_a_disconnected_receiver() {
+        let (tx, rx) = event_queue_with_backlog(1, 16);
+        tx.send(created(0)).unwrap();
+        tx.send(created(1)).unwrap();
+        drop(rx);
+        assert!(tx.flush().is_err());
+        assert!(tx.send(created(2)).is_err());
     }
 
     #[test]
